@@ -8,7 +8,7 @@ let package = Package(
     platforms: [.macOS(.v14), .iOS(.v16)],
     products: [
         .library(
-            name: "LLM",
+            name: "MLXLLM",
             targets: ["MLXLLM"]),
         .library(
             name: "MNIST",
