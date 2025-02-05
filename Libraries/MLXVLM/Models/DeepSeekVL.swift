@@ -23,9 +23,13 @@ public struct DeepSeekVLConfiguration: Codable, Sendable {
         public let kvHeads: Int
         public let rmsNormEps: Float
         public let ropeTheta: Float
-        public let ropeTraditional: Bool
-        public let attentionBias: Bool
+        public let ropeTraditional: Bool { _ropeTraditional ?? true }
+        public let attentionBias: Bool { _attentionBias ?? false }
         public let scoringFunction: String
+
+        private let _ropeTraditional: Bool?
+        private let _rmsNormEps: Float?
+        private let _attentionBias: Bool?
 
         enum CodingKeys: String, CodingKey {
             case modelType = "model_type"
@@ -37,8 +41,10 @@ public struct DeepSeekVLConfiguration: Codable, Sendable {
             case kvHeads = "num_key_value_heads"
             case rmsNormEps = "rms_norm_eps"
             case ropeTheta = "rope_theta"
-            case ropeTraditional = "rope_traditional"
+            case _ropeTraditional = "rope_traditional"
             case attentionBias = "attention_bias"
+            case _attentionBias = "attention_bias"
+            case _rmsNormEps = "rms_norm_eps"
             case scoringFunction = "scoring_function"
         }
     }
@@ -306,6 +312,12 @@ private enum Language {
 // MARK: - Vision
 
 private enum Vision {
+    static func checkArrayShape(_ arr: MLXArray) -> Bool {
+        if arr.ndim != 4 { return false }
+        let (o, h, w, _) = (arr.dim(0), arr.dim(1), arr.dim(2), arr.dim(3))
+        return (o >= h && o >= w && h == w)
+    }
+
     fileprivate class Attention: Module {
         let numHeads: Int
         let scale: Float
@@ -425,13 +437,31 @@ private enum Vision {
             self._postLayerNorm.wrappedValue = LayerNorm(dimensions: config.width)
         }
 
+        func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+            var sanitizedWeights = [String: MLXArray]()
+            for (k, v) in weights {
+                if k.contains("position_id") {
+                    continue
+                } else if k.contains("patch_embedding.weight") {
+                    if checkArrayShape(v) {
+                        sanitizedWeights[k] = v
+                    } else {
+                        sanitizedWeights[k] = v.transposed(0, 2, 3, 1)
+                    }
+                } else {
+                    sanitizedWeights[k] = v
+                }
+            }
+            return sanitizedWeights
+        }
+
         func callAsFunction(_ x: MLXArray, outputHiddenStates: Bool = false) -> (
             MLXArray, MLXArray, MLXArray?
         ) {
             let x = embeddings(x)
-
             var encoderStates: [MLXArray]? = outputHiddenStates ? [] : nil
             var h = x
+
             for layer in encoder {
                 h = layer(h)
                 if outputHiddenStates {
@@ -504,6 +534,31 @@ public class DeepSeekVL: Module, VLMModel, KVCacheDimensionProvider {
         languageModel.layers.map { ($0.attention, ["q_proj", "v_proj"]) }
     }
 
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        var renamed = [String: MLXArray]()
+        for (k, v) in weights {
+            var newKey = k
+            if newKey.hasPrefix("model.") {
+                newKey.removeFirst("model.".count)
+            } else if newKey.hasPrefix("lm_head.") {
+                newKey = "language_model." + newKey
+            }
+            renamed[newKey] = v
+        }
+
+        var final = [String: MLXArray]()
+        for (k, v) in renamed {
+            if k.hasPrefix("text_model.") {
+                let suffix = String(k.dropFirst("text_model.".count))
+                final["language_model." + suffix] = v
+            } else {
+                final[k] = v
+            }
+        }
+
+        return visionModel.sanitize(weights: final)
+    }
+
     public init(_ config: DeepSeekVLConfiguration) {
         self.config = config
         self._visionModel.wrappedValue = Vision.VisionModel(config.visionConfiguration)
@@ -518,15 +573,15 @@ public class DeepSeekVL: Module, VLMModel, KVCacheDimensionProvider {
             return languageModel.embedTokens(inputIds)
         }
 
-        let inputEmbeddings = languageModel.embedTokens(inputIds)
-        let (hiddenState, _, _) = visionModel(pixelValues.transposed(0, 2, 3, 1))
+        let inputEmbedding = languageModel.embedTokens(inputIds)
+        let (hiddenState, _, _) = visionModel(
+            pixelValues.transposed(0, 2, 3, 1),
+            outputHiddenStates: true
+        )
         let imageFeatures = projector(hiddenState)
 
-        // Find positions of image tokens and replace them with image features
         let imagePositions = inputIds .== config.imageTokenIndex
-        let result = where(imagePositions, imageFeatures, inputEmbeddings)
-
-        return result
+        return where(imagePositions, imageFeatures, inputEmbedding)
     }
 
     public func prepare(
