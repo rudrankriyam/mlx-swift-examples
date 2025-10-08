@@ -46,7 +46,7 @@ class MLXService {
     /// - Parameter model: The model configuration to load
     /// - Returns: A ModelContainer instance containing the loaded model
     /// - Throws: Errors that might occur during model loading
-    private func load(model: LMModel) async throws -> ModelContainer {
+    func load(model: LMModel) async throws -> ModelContainer {
         // Set GPU memory limit to prevent out of memory issues
         MLX.GPU.set(cacheLimit: 20 * 1024 * 1024)
 
@@ -122,5 +122,48 @@ class MLXService {
             return try MLXLMCommon.generate(
                 input: lmInput, parameters: parameters, context: context)
         }
+    }
+
+    /// Generates structured text based on a JSON schema constraint
+    /// - Parameters:
+    ///   - prompt: The user's input prompt
+    ///   - jsonSchema: JSON schema to constrain the output
+    ///   - model: The language model to use for generation
+    /// - Returns: An AsyncStream of generated text tokens
+    /// - Throws: Errors that might occur during generation
+    func generateStructured(prompt: String, jsonSchema: String, model: LMModel) async throws -> AsyncStream<Generation> {
+        
+        // Create a much clearer system prompt that focuses on generating DATA, not schema
+        let systemPrompt = """
+        You are a helpful assistant that responds with valid JSON data.
+        
+        CRITICAL: Your response must be ONLY valid JSON. No thinking, no explanations, no extra text.
+        
+        JSON Schema to follow:
+        \(jsonSchema)
+        
+        STRICT RULES:
+        1. Start your response immediately with {
+        2. End your response with }
+        3. NO 
+        
+        /nothink
+        """
+        
+        // Simple, direct user prompt
+        let userPrompt = prompt
+        
+        print("🔧 MLX System Prompt:")
+        print(systemPrompt)
+        print("🔧 MLX User Prompt:")
+        print(userPrompt)
+        
+        // Create messages with structured prompting
+        let messages = [
+            Message.system(systemPrompt),
+            Message.user(userPrompt)
+        ]
+        
+        return try await generate(messages: messages, model: model)
     }
 }

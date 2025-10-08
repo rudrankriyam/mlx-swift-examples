@@ -6,12 +6,27 @@
 //
 
 import SwiftUI
+import FoundationModels
 
 @main
 struct MLXChatExampleApp: App {
     var body: some Scene {
         WindowGroup {
-            ChatView(viewModel: ChatViewModel(mlxService: MLXService()))
+            if #available(iOS 26.0, macOS 26.0, *) {
+                StructuredComparisonView(
+                    viewModel: StructuredComparisonViewModel(
+                        mlxService: MLXService(),
+                        foundationService: FoundationModelsService()
+                    )
+                )
+            } else {
+                ComparisonChatView(
+                    viewModel: ComparisonChatViewModel(
+                        mlxService: MLXService(),
+                        foundationService: FoundationModelsService()
+                    )
+                )
+            }
         }
     }
 }

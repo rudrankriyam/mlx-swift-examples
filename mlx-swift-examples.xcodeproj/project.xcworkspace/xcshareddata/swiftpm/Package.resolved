@@ -1,5 +1,5 @@
 {
-  "originHash" : "55d5099a3922c7d1cda4d665a8617602fbf5751cd5f491d11bc8c9b9bd8acb6b",
+  "originHash" : "3ba43c1b4365c2e1e878ec1f9e07f7bfe5c7cab580842ee560597e8ab04cdcbe",
   "pins" : [
     {
       "identity" : "gzipswift",
@@ -96,8 +96,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-numerics",
       "state" : {
-        "revision" : "e0ec0f5f3af6f3e4d5e7a19d2af26b481acb6ba8",
-        "version" : "1.0.3"
+        "revision" : "0c0290ff6b24942dadb83a929ffaaa1481df04a2",
+        "version" : "1.1.1"
       }
     },
     {
