@@ -24,6 +24,29 @@ public final class Qwen3VLProcessor: UserInputProcessor {
         self.tokenizer = tokenizer
     }
 
+    private func makeAttentionMask(for tokens: [Int]) -> MLXArray {
+        guard !tokens.isEmpty else {
+            return MLXArray.zeros([1, 0], dtype: .int32)
+        }
+
+        var maskValues = Array(repeating: Int32(1), count: tokens.count)
+
+        if let padToken = tokenizer.eosTokenId {
+            let lastNonPad = tokens.lastIndex(where: { $0 != padToken }) ?? -1
+            if lastNonPad < 0 {
+                maskValues = Array(repeating: Int32(0), count: tokens.count)
+            } else if lastNonPad < tokens.count - 1 {
+                for index in (lastNonPad + 1) ..< tokens.count {
+                    maskValues[index] = 0
+                }
+            }
+        }
+
+        var mask = MLXArray(maskValues)
+        mask = mask.expandedDimensions(axis: 0)
+        return mask.asType(.int32)
+    }
+
     private func preprocess(image: CIImage, resizedSize: CGSize) -> CIImage {
         image
             .toSRGB()
@@ -75,7 +98,7 @@ public final class Qwen3VLProcessor: UserInputProcessor {
 
         if input.images.isEmpty, input.videos.isEmpty {
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
-            let mask = ones(like: promptArray).asType(.int8)
+            let mask = makeAttentionMask(for: promptTokens)
             return LMInput(text: .init(tokens: promptArray, mask: mask))
         }
 
@@ -145,7 +168,7 @@ public final class Qwen3VLProcessor: UserInputProcessor {
         }
 
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
-        let mask = ones(like: promptArray).asType(.int8)
+        let mask = makeAttentionMask(for: promptTokens)
 
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
@@ -1673,7 +1696,7 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             inputIds,
             cache: typedCache,
             inputEmbeddings: inputEmbeddings,
-            mask: nil,
+            mask: inputMask,
             positionIds: nil,
             visualMask: visualMask,
             deepstackEmbeds: deepstackEmbeds,
