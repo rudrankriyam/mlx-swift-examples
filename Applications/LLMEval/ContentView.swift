@@ -20,6 +20,7 @@ struct ContentView: View {
     }
 
     @State private var selectedDisplayStyle = displayStyle.markdown
+    @State private var useBatchMode = false
 
     var body: some View {
         VStack(alignment: .leading) {
@@ -36,12 +37,19 @@ struct ContentView: View {
                     Toggle(isOn: $llm.includeWeatherTool) {
                         Text("Include tools")
                     }
-                    .frame(maxWidth: 350, alignment: .leading)
+                    .frame(maxWidth: 150, alignment: .leading)
                     Toggle(isOn: $llm.enableThinking) {
                         Text("Thinking")
                             .help(
                                 "Switches between thinking and non-thinking modes. Support: Qwen3")
                     }
+                    .frame(maxWidth: 150, alignment: .leading)
+                    Toggle(isOn: $useBatchMode) {
+                        Text("Batch Mode")
+                            .help(
+                                "Generate responses for multiple prompts in parallel. Enter prompts separated by newlines.")
+                    }
+                    .frame(maxWidth: 150, alignment: .leading)
                     Spacer()
                     if llm.running {
                         ProgressView()
@@ -65,34 +73,109 @@ struct ContentView: View {
             }
 
             // show the model output
-            ScrollView(.vertical) {
-                ScrollViewReader { sp in
-                    Group {
-                        if selectedDisplayStyle == .plain {
-                            Text(llm.output)
-                                .textSelection(.enabled)
-                        } else {
-                            Markdown(llm.output)
-                                .textSelection(.enabled)
+            if useBatchMode && !llm.batchResults.isEmpty {
+                // Side-by-side batch results
+                HStack(spacing: 0) {
+                    ForEach(Array(llm.batchResults.enumerated()), id: \.offset) { idx, result in
+                        VStack(alignment: .leading, spacing: 8) {
+                            // Header
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Prompt \(idx + 1)")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundColor(.blue)
+                                Text(result.prompt)
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(2)
+                                Divider()
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.top, 8)
+
+                            // Response in scrollable area
+                            ScrollView(.vertical) {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    if selectedDisplayStyle == .plain {
+                                        Text(result.response)
+                                            .font(.system(size: 11))
+                                            .textSelection(.enabled)
+                                    } else {
+                                        Markdown(result.response)
+                                            .markdownTextStyle(\.text) {
+                                                FontSize(11)
+                                            }
+                                            .textSelection(.enabled)
+                                    }
+
+                                    // Footer
+                                    Text("\(result.tokenCount) tokens • \(result.finishReason)")
+                                        .font(.system(size: 9))
+                                        .foregroundColor(.secondary)
+                                        .padding(.top, 8)
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.bottom, 8)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.gray.opacity(0.05))
+
+                        if idx < llm.batchResults.count - 1 {
+                            Divider()
                         }
                     }
-                    .onChange(of: llm.output) { _, _ in
-                        sp.scrollTo("bottom")
-                    }
+                }
+            } else {
+                // Standard single output
+                ScrollView(.vertical) {
+                    ScrollViewReader { sp in
+                        Group {
+                            if selectedDisplayStyle == .plain {
+                                Text(llm.output)
+                                    .textSelection(.enabled)
+                            } else {
+                                Markdown(llm.output)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                        .onChange(of: llm.output) { _, _ in
+                            sp.scrollTo("bottom")
+                        }
 
-                    Spacer()
-                        .frame(width: 1, height: 1)
-                        .id("bottom")
+                        Spacer()
+                            .frame(width: 1, height: 1)
+                            .id("bottom")
+                    }
                 }
             }
 
             HStack {
-                TextField("prompt", text: Bindable(llm).prompt)
-                    .onSubmit(generate)
-                    .disabled(llm.running)
+                if useBatchMode {
+                    ZStack(alignment: .topLeading) {
+                        if llm.prompt.isEmpty {
+                            Text("Enter multiple prompts, one per line:\nHi\nWhat is quantum computing and why is it important?")
+                                .foregroundColor(.gray.opacity(0.6))
+                                .padding(.top, 8)
+                                .padding(.leading, 5)
+                        }
+                        TextEditor(text: Bindable(llm).prompt)
+                            .frame(height: 60)
+                            .disabled(llm.running)
+                            .opacity(llm.prompt.isEmpty ? 0.5 : 1)
+                    }
                     #if os(visionOS)
-                        .textFieldStyle(.roundedBorder)
+                        .border(Color.gray, width: 1)
+                    #else
+                        .border(Color.gray.opacity(0.5), width: 1)
                     #endif
+                } else {
+                    TextField("prompt", text: Bindable(llm).prompt)
+                        .onSubmit(generate)
+                        .disabled(llm.running)
+                        #if os(visionOS)
+                            .textFieldStyle(.roundedBorder)
+                        #endif
+                }
                 Button(llm.running ? "stop" : "generate", action: llm.running ? cancel : generate)
             }
         }
@@ -143,7 +226,11 @@ struct ContentView: View {
     }
 
     private func generate() {
-        llm.generate()
+        if useBatchMode {
+            llm.generateBatch()
+        } else {
+            llm.generate()
+        }
     }
 
     private func cancel() {
@@ -166,6 +253,15 @@ class LLMEvaluator {
 
     var running = false
 
+    // Store batch results for side-by-side display
+    struct BatchResult {
+        let prompt: String
+        let response: String
+        let tokenCount: Int
+        let finishReason: String
+    }
+    var batchResults: [BatchResult] = []
+
     var includeWeatherTool = false
     var enableThinking = false
 
@@ -174,12 +270,11 @@ class LLMEvaluator {
     var modelInfo = ""
     var stat = ""
 
-    /// This controls which model loads. `qwen2_5_1_5b` is one of the smaller ones, so this will fit on
-    /// more devices.
-    let modelConfiguration = LLMRegistry.qwen3_1_7b_4bit
+    /// This controls which model loads. Using Llama 3.2 3B to match Python's batch generation example.
+    let modelConfiguration = LLMRegistry.llama3_2_3B_4bit
 
     /// parameters controlling the output
-    let generateParameters = GenerateParameters(maxTokens: 240, temperature: 0.6)
+    let generateParameters = GenerateParameters(maxTokens: 500, temperature: 0.6)
     let updateInterval = Duration.seconds(0.25)
 
     /// A task responsible for handling the generation process.
@@ -335,6 +430,185 @@ class LLMEvaluator {
             running = true
             await generate(prompt: currentPrompt)
             running = false
+        }
+    }
+
+    func generateBatch() {
+        guard !running else { return }
+        let currentPrompt = prompt
+        prompt = ""
+        batchResults = [] // Clear previous results
+        generationTask = Task {
+            running = true
+            await generateBatchPrompts(promptText: currentPrompt)
+            running = false
+        }
+    }
+
+    private func generateBatchPrompts(promptText: String) async {
+        self.output = ""
+
+        // Split prompts by newlines and filter empty ones
+        let prompts = promptText
+            .split(separator: "\n")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !prompts.isEmpty else {
+            self.output = "No prompts provided. Enter prompts separated by newlines."
+            return
+        }
+
+        self.output = "Processing \(prompts.count) prompts in batch...\n\n"
+
+        do {
+            let modelContainer = try await load()
+
+            // Seed for deterministic results
+            MLXRandom.seed(UInt64(Date.timeIntervalSinceReferenceDate * 1000))
+
+            try await modelContainer.perform { (context: ModelContext) -> Void in
+                // Create batch parameters with deterministic sampling
+                var batchGenParams = generateParameters
+                batchGenParams.temperature = 0.0  // Greedy/deterministic sampling
+
+                let batchParams = BatchGenerateParameters(
+                    maxTokens: generateParameters.maxTokens ?? 128,
+                    completionBatchSize: 32,
+                    prefillBatchSize: 8,
+                    prefillStepSize: 2048,
+                    generation: batchGenParams
+                )
+
+                // Use streaming batch generation
+                // Apply chat template to each prompt
+                let tokenized: [[Int]] = try prompts.map { prompt in
+                    let messages = [[
+                        "role": "user",
+                        "content": prompt
+                    ]]
+                    return try context.tokenizer.applyChatTemplate(messages: messages)
+                }
+                let defaultMaxTokens = Array(
+                    repeating: batchParams.defaultMaxTokens, count: tokenized.count)
+
+                // Set up stop tokens (matches batchGenerate pattern)
+                var stopTokens = Set<Int>()
+                if let eos = context.tokenizer.eosTokenId {
+                    stopTokens.insert(eos)
+                }
+                for token in context.configuration.extraEOSTokens {
+                    if let id = context.tokenizer.convertTokenToId(token) {
+                        stopTokens.insert(id)
+                    }
+                }
+
+                var iterator = BatchTokenIterator(
+                    model: context.model,
+                    parameters: batchParams,
+                    stopTokens: stopTokens,
+                    unknownTokenId: context.tokenizer.unknownTokenId
+                )
+
+                let uids = iterator.insert(prompts: tokenized, maxTokens: defaultMaxTokens)
+
+                // Initialize batch results with empty responses
+                Task { @MainActor in
+                    self.batchResults = prompts.enumerated().map { (idx, prompt) in
+                        BatchResult(
+                            prompt: prompt,
+                            response: "",
+                            tokenCount: 0,
+                            finishReason: "generating"
+                        )
+                    }
+                }
+
+                var generatedTokens = [Int: [Int]]()
+                var finishReasons = [Int: BatchGenerateResult.FinishReason]()
+
+                // Stream tokens and update UI incrementally
+                while let responses = iterator.next(), !responses.isEmpty {
+                    for response in responses {
+                        if response.finishReason != .stop {
+                            generatedTokens[response.uid, default: []].append(response.token)
+                        }
+                        if let reason = response.finishReason {
+                            finishReasons[response.uid] = reason
+                        }
+                    }
+
+                    // Update UI with current state
+                    Task { @MainActor in
+                        self.batchResults = uids.enumerated().map { (idx, uid) in
+                            let tokens = generatedTokens[uid] ?? []
+                            let text = context.tokenizer.decode(tokens: tokens, skipSpecialTokens: true)
+                            let finish = finishReasons[uid]?.rawValue ?? "generating"
+
+                            return BatchResult(
+                                prompt: prompts[idx],
+                                response: text,
+                                tokenCount: tokens.count,
+                                finishReason: finish
+                            )
+                        }
+                    }
+
+                    // Small delay to batch UI updates
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+
+                Stream().synchronize()
+
+                let stats = iterator.stats()
+
+                // Final update with statistics
+                Task { @MainActor in
+                    self.batchResults = uids.enumerated().map { (idx, uid) in
+                        let tokens = generatedTokens[uid] ?? []
+                        let text = context.tokenizer.decode(tokens: tokens, skipSpecialTokens: true)
+                        let finish = finishReasons[uid]?.rawValue ?? "complete"
+
+                        return BatchResult(
+                            prompt: prompts[idx],
+                            response: text,
+                            tokenCount: tokens.count,
+                            finishReason: finish
+                        )
+                    }
+
+                    // Also set output for non-batch mode fallback
+                    var formattedOutput = "# Batch Generation Results\n\n"
+                    for (idx, batch) in self.batchResults.enumerated() {
+                        formattedOutput += "### Prompt \(idx + 1)\n"
+                        formattedOutput += "> \(batch.prompt)\n\n"
+                        formattedOutput += "**Response:**\n"
+                        formattedOutput += "\(batch.response)\n\n"
+                        formattedOutput += "*\(batch.tokenCount) tokens • \(batch.finishReason)*\n\n"
+                        if idx < self.batchResults.count - 1 {
+                            formattedOutput += "---\n\n"
+                        }
+                    }
+
+                    // Add statistics
+                    formattedOutput += "\n---\n\n## 📊 Statistics\n\n"
+                    formattedOutput += "| Metric | Value |\n"
+                    formattedOutput += "|--------|-------|\n"
+                    formattedOutput += "| Prompt Tokens | \(stats.promptTokenCount) |\n"
+                    formattedOutput += "| Prompt TPS | \(String(format: "%.2f", stats.promptTokensPerSecond)) |\n"
+                    formattedOutput += "| Prompt Time | \(String(format: "%.2f", stats.promptTime))s |\n"
+                    formattedOutput += "| Generation Tokens | \(stats.generationTokenCount) |\n"
+                    formattedOutput += "| Generation TPS | \(String(format: "%.2f", stats.generationTokensPerSecond)) |\n"
+                    formattedOutput += "| Generation Time | \(String(format: "%.2f", stats.generationTime))s |\n"
+                    formattedOutput += "| Peak Memory | \(String(format: "%.2f", stats.peakMemoryGB)) GB |\n"
+
+                    self.output = formattedOutput
+                    self.stat = "\(String(format: "%.2f", stats.generationTokensPerSecond)) tokens/s (batch)"
+                }
+            }
+
+        } catch {
+            output = "Failed: \(error)"
         }
     }
 

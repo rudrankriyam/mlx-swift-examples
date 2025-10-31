@@ -76,14 +76,8 @@ private class Attention: Module {
         keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        // Apply RoPE positioning
-        if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
-        } else {
-            queries = rope(queries)
-            keys = rope(keys)
-        }
+        queries = applyRoPE(queries, cache: cache, rope: rope.callAsFunction)
+        keys = applyRoPE(keys, cache: cache, rope: rope.callAsFunction)
 
         // Use the automatic attention router that handles both quantized and regular caches
         let output = attentionWithCacheUpdate(

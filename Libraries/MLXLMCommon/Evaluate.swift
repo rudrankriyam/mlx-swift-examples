@@ -734,6 +734,52 @@ public func generate(
     )
 }
 
+// MARK: - Batched Generation
+
+/// Generate completions for multiple prompts using the batched iterator.
+///
+/// ```
+/// let batchParameters = BatchGenerateParameters(completionBatchSize: 8)
+/// let result = try generate(
+///     prompts: ["Hello", "How are you?"], batchParameters: batchParameters, context: context)
+/// ```
+///
+/// - Parameters:
+///   - prompts: The textual prompts to evaluate.
+///   - maxTokens: Optional per-prompt maximum token counts. Defaults to `batchParameters.defaultMaxTokens`.
+///   - batchParameters: Batched generation configuration.
+///   - context: Model context that provides the model and tokenizer.
+/// - Returns: A ``BatchGenerateResult`` containing ordered sequences and statistics.
+@discardableResult
+public func generate(
+    prompts: [String],
+    maxTokens: [Int]? = nil,
+    batchParameters: BatchGenerateParameters,
+    context: ModelContext
+) throws -> BatchGenerateResult {
+    try batchGenerate(
+        prompts: prompts,
+        maxTokens: maxTokens,
+        parameters: batchParameters,
+        context: context)
+}
+
+public extension ModelContext {
+    /// Convenience wrapper that generates batched completions using the receiver as context.
+    @discardableResult
+    func generate(
+        prompts: [String],
+        maxTokens: [Int]? = nil,
+        batchParameters: BatchGenerateParameters
+    ) throws -> BatchGenerateResult {
+        try batchGenerate(
+            prompts: prompts,
+            maxTokens: maxTokens,
+            parameters: batchParameters,
+            context: self)
+    }
+}
+
 /// Generates tokens asynchronously using the provided language model input, parameters, and context.
 ///
 /// This function initializes a `TokenIterator` with the given input, model, and generation parameters,
