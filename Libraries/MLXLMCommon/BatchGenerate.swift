@@ -326,10 +326,9 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
         let previousLogProbs = currentBatch.logProbs
 
         // Compute next iteration's tokens asynchronously
-        var cache = currentBatch.cache
+        // Mutate cache in-place to avoid copy-on-write overhead
         let (nextTokens, nextLogProbs) = step(
-            inputTokens: previousTokens[0..., .newAxis], cache: &cache)
-        currentBatch.cache = cache
+            inputTokens: previousTokens[0..., .newAxis], cache: &currentBatch.cache)
         asyncEval(nextTokens, nextLogProbs)
 
         // Materialize tokens to CPU - this synchronizes with GPU

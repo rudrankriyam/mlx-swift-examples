@@ -493,14 +493,14 @@ struct BenchmarkCommand: AsyncParsableCommand {
                     )
                     GPU.clearCache()
                 }
-            }
 
-            if let averages = averageStats(trials) {
-                print(
-                    "Averages: prompt_tps=\(format(averages.promptTPS)), generation_tps=\(format(averages.generationTPS)), peak_memory=\(format(averages.peakMemory))"
-                )
-            } else {
-                print("Averages: prompt_tps=0.000, generation_tps=0.000, peak_memory=0.000")
+                if let averages = averageStats(trials) {
+                    print(
+                        "Averages: prompt_tps=\(format(averages.promptTPS)), generation_tps=\(format(averages.generationTPS)), peak_memory=\(format(averages.peakMemory))"
+                    )
+                } else {
+                    print("Averages: prompt_tps=0.000, generation_tps=0.000, peak_memory=0.000")
+                }
             }
         }
 
