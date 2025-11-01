@@ -321,20 +321,19 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
             tic = now
         }
 
-        eval(currentBatch.tokens, currentBatch.logProbs)
-
+        // Store references to previous iteration's results
         let previousTokens = currentBatch.tokens
         let previousLogProbs = currentBatch.logProbs
 
+        // Compute next iteration's tokens asynchronously
         var cache = currentBatch.cache
         let (nextTokens, nextLogProbs) = step(
             inputTokens: previousTokens[0..., .newAxis], cache: &cache)
         currentBatch.cache = cache
         asyncEval(nextTokens, nextLogProbs)
 
-        previousTokens.eval()
-        previousLogProbs.eval()
-
+        // Synchronize only when we need to read the results
+        // This allows GPU to work on next iteration while CPU processes current results
         let tokenArray = previousTokens.asArray(Int.self)
 
 

@@ -665,10 +665,9 @@ extension BenchmarkCommand {
 
         _ = iterator.insert(prompts: prompts, maxTokens: maxTokens)
 
-        while let responses = iterator.next(), !responses.isEmpty {
-            for response in responses {
-                response.logProbs.eval()
-            }
+        // Consume all responses without evaluating logprobs (matches Python benchmark)
+        while let _ = iterator.next() {
+            // Python doesn't evaluate logprobs during benchmarking
         }
 
         Stream().synchronize()
