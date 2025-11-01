@@ -351,9 +351,6 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
             if stopTokens.contains(token) {
                 finish = .stop
                 endIndices.append(idx)
-            } else if let unknownTokenId, token == unknownTokenId {
-                finish = .unspecified
-                endIndices.append(idx)
             } else if currentBatch.numTokens[idx] >= currentBatch.maxTokens[idx] {
                 finish = .length
                 endIndices.append(idx)

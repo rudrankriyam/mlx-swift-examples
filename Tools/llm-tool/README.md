@@ -50,6 +50,33 @@ See also:
 
 - [MLX troubleshooting](https://swiftpackageindex.com/ml-explore/mlx-swift/main/documentation/mlx/troubleshooting)
 
+### Benchmarking batched generation
+
+The `benchmark` subcommand mirrors the Python tooling from `mlx-lm` PR #443. By default it
+loads `mlx-community/Llama-3.2-3B-Instruct-4bit`, synthesises random token prompts, warms up
+once, and then reports prompt/gen tokens-per-second and peak memory across multiple trials.
+
+```
+./mlx-run llm-tool benchmark \
+    --model mlx-community/Llama-3.2-3B-Instruct-4bit \
+    --prompt-tokens 512 \
+    --generation-tokens 1024 \
+    --batch-size 4 \
+    --num-trials 5
+```
+
+To compare against real prompts, supply them inline or via a file:
+
+```
+./mlx-run llm-tool benchmark \
+    --prompts "Explain transformers." "Why is the sky blue?" \
+    --generation-tokens 256
+```
+
+Use `--prompts-file` for newline- or blank-line-separated prompts, `--apply-chat-template`
+to wrap them with the tokenizer chat template, and `--mode stream` to benchmark the single
+sequence iterator instead of the batch pipeline.
+
 ### Troubleshooting
 
 If the program crashes with a very deep stack trace you may need to build

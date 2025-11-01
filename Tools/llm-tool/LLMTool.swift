@@ -15,7 +15,10 @@ struct LLMTool: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Command line tool for generating text and manipulating LLMs",
         subcommands: [
-            EvaluateCommand.self, ChatCommand.self, LoRACommand.self,
+            EvaluateCommand.self,
+            BenchmarkCommand.self,
+            ChatCommand.self,
+            LoRACommand.self,
             ListCommands.self,
         ],
         defaultSubcommand: EvaluateCommand.self)
@@ -196,6 +199,76 @@ struct GenerateArguments: ParsableArguments, Sendable {
     }
 }
 
+/// Arguments controlling benchmark execution.
+struct BenchmarkArguments: ParsableArguments, Sendable {
+
+    enum Mode: String, ExpressibleByArgument {
+        case batch
+        case stream
+    }
+
+    @Option(
+        name: .long,
+        help: "Length of randomly generated prompt in tokens (ignored when providing prompts)."
+    )
+    var promptTokens: Int = 512
+
+    @Option(
+        name: .long,
+        help: "Maximum number of tokens to generate per prompt."
+    )
+    var generationTokens: Int = 1_024
+
+    @Option(
+        name: .long,
+        help: "Number of prompts in the batch. Ignored when prompts are provided."
+    )
+    var batchSize: Int = 1
+
+    @Option(
+        name: .long,
+        help: "Number of timed benchmark trials."
+    )
+    var numTrials: Int = 5
+
+    @Option(
+        name: .long,
+        help: "Seed used when generating random token prompts."
+    )
+    var seed: UInt64 = 0
+
+    @Option(
+        name: .long,
+        help: "Benchmark mode: batched generation or single-stream generation."
+    )
+    var mode: Mode = .batch
+
+    @Option(
+        name: .long,
+        parsing: .upToNextOption,
+        help: "Explicit prompts to benchmark (repeat flag to supply multiple prompts)."
+    )
+    var prompts: [String] = []
+
+    @Option(
+        name: .long,
+        help: "Path to a file containing prompts (one per line or separated by blank lines)."
+    )
+    var promptsFile: String?
+
+    @Flag(
+        name: .long,
+        help: "Apply the tokenizer chat template to provided prompts."
+    )
+    var applyChatTemplate = false
+
+    @Option(
+        name: .long,
+        help: "System prompt to prepend when applying the chat template."
+    )
+    var systemPrompt: String?
+}
+
 /// Argument package for adjusting and reporting memory use.
 struct MemoryArguments: ParsableArguments, Sendable {
 
@@ -268,6 +341,379 @@ struct MemoryArguments: ParsableArguments, Sendable {
             print(startMemory.delta(endMemory).description)
 
         }
+    }
+}
+
+struct BenchmarkCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "benchmark",
+        abstract: "Benchmark batched or streaming generation throughput."
+    )
+
+    @OptionGroup var args: ModelArguments
+    @OptionGroup var memory: MemoryArguments
+    @OptionGroup var benchmark: BenchmarkArguments
+
+    private static let defaultModel = MLXLLM.LLMRegistry.llama3_2_3B_4bit
+
+    mutating func run() async throws {
+        guard benchmark.numTrials > 0 else {
+            throw ValidationError("--num-trials must be greater than zero")
+        }
+
+        let hub: HubApi
+        if let download = args.download {
+            hub = HubApi(downloadBase: download)
+        } else {
+            hub = HubApi()
+        }
+
+        let modelContainer = try await memory.start { [args] in
+            try await args.load(defaultModel: Self.defaultModel.name, modelFactory: LLMModelFactory.shared)
+        }
+
+        let configuration = await modelContainer.configuration
+        let vocabSize = loadVocabSize(configuration: configuration, hub: hub) ?? 32_000
+        let providedPrompts = try loadPrompts()
+
+        try await modelContainer.perform { context in
+            let tokenPrompts: [[Int]]
+            if let providedPrompts, !providedPrompts.isEmpty {
+                tokenPrompts = try encodePrompts(
+                    providedPrompts,
+                    tokenizer: context.tokenizer,
+                    applyChatTemplate: benchmark.applyChatTemplate,
+                    systemPrompt: benchmark.systemPrompt
+                )
+            } else {
+                guard benchmark.batchSize > 0 else {
+                    throw ValidationError("--batch-size must be greater than zero when prompts are not provided")
+                }
+
+                guard benchmark.promptTokens > 0 else {
+                    throw ValidationError("--prompt-tokens must be greater than zero when prompts are not provided")
+                }
+
+                MLXRandom.seed(benchmark.seed)
+                tokenPrompts = makeRandomPrompts(
+                    batchSize: benchmark.batchSize,
+                    promptLength: benchmark.promptTokens,
+                    vocabSize: vocabSize
+                )
+            }
+
+            guard !tokenPrompts.isEmpty else {
+                throw ValidationError("No prompts available for benchmarking")
+            }
+
+            let effectiveBatchSize = benchmark.mode == .stream ? 1 : tokenPrompts.count
+            let completionBatchSize = max(effectiveBatchSize, 1)
+            let prefillBatchSize = max(1, min(8, completionBatchSize))
+
+            var generationParameters = GenerateParameters(maxTokens: benchmark.generationTokens)
+            generationParameters.temperature = 0.0
+
+            let batchParameters = BatchGenerateParameters(
+                maxTokens: benchmark.generationTokens,
+                completionBatchSize: completionBatchSize,
+                prefillBatchSize: prefillBatchSize,
+                prefillStepSize: 2_048,
+                generation: generationParameters
+            )
+
+            let maxTokens = Array(repeating: benchmark.generationTokens, count: tokenPrompts.count)
+            let promptSummaryLength: Int = {
+                if providedPrompts != nil {
+                    return tokenPrompts.map(\.count).max() ?? 0
+                } else {
+                    return benchmark.promptTokens
+                }
+            }()
+
+            print("Running warmup..")
+            switch benchmark.mode {
+            case .batch:
+                _ = try runBatch(
+                    context: context,
+                    prompts: tokenPrompts,
+                    maxTokens: maxTokens,
+                    parameters: batchParameters
+                )
+            case .stream:
+                guard let firstPrompt = tokenPrompts.first else {
+                    throw ValidationError("Stream mode requires at least one prompt")
+                }
+                _ = try runStream(
+                    context: context,
+                    prompt: firstPrompt,
+                    parameters: generationParameters
+                )
+            }
+            GPU.clearCache()
+
+            let reportedBatchSize = benchmark.mode == .stream ? 1 : tokenPrompts.count
+            print(
+                "Timing with promptTokens=\(promptSummaryLength), generationTokens=\(benchmark.generationTokens), batchSize=\(reportedBatchSize)."
+            )
+
+            var trials: [BatchGenerateStats] = []
+            trials.reserveCapacity(benchmark.numTrials)
+
+            for trialIndex in 0..<benchmark.numTrials {
+                let stats: BatchGenerateStats
+                switch benchmark.mode {
+                case .batch:
+                    stats = try runBatch(
+                        context: context,
+                        prompts: tokenPrompts,
+                        maxTokens: maxTokens,
+                        parameters: batchParameters
+                    )
+                case .stream:
+                    guard let firstPrompt = tokenPrompts.first else {
+                        throw ValidationError("Stream mode requires at least one prompt")
+                    }
+                    stats = try runStream(
+                        context: context,
+                        prompt: firstPrompt,
+                        parameters: generationParameters
+                    )
+                }
+
+                trials.append(stats)
+                print(
+                    "Trial \(trialIndex + 1):  prompt_tps=\(format(stats.promptTokensPerSecond)), generation_tps=\(format(stats.generationTokensPerSecond)), peak_memory=\(format(stats.peakMemoryGB))"
+                )
+                GPU.clearCache()
+            }
+
+            if let averages = averageStats(trials) {
+                print(
+                    "Averages: prompt_tps=\(format(averages.promptTPS)), generation_tps=\(format(averages.generationTPS)), peak_memory=\(format(averages.peakMemory))"
+                )
+            } else {
+                print("Averages: prompt_tps=0.000, generation_tps=0.000, peak_memory=0.000")
+            }
+        }
+
+        memory.reportMemoryStatistics()
+    }
+}
+
+extension BenchmarkCommand {
+    private func loadPrompts() throws -> [String]? {
+        var prompts = benchmark.prompts.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        if let filePath = benchmark.promptsFile {
+            let url = URL(fileURLWithPath: filePath)
+            let contents = try String(contentsOf: url, encoding: .utf8)
+            prompts.append(contentsOf: parsePromptFile(contents))
+        }
+
+        let filtered = prompts.filter { !$0.isEmpty }
+        return filtered.isEmpty ? nil : filtered
+    }
+
+    private func parsePromptFile(_ contents: String) -> [String] {
+        let normalized = contents.replacingOccurrences(of: "\r\n", with: "\n")
+
+        let dashSeparated = normalized.components(separatedBy: "\n---\n")
+        var prompts: [String] = []
+        for segment in dashSeparated {
+            let trimmed = segment.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                continue
+            }
+            let blankSeparated = trimmed
+                .components(separatedBy: "\n\n")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            if blankSeparated.count > 1 {
+                prompts.append(contentsOf: blankSeparated)
+            } else {
+                prompts.append(trimmed)
+            }
+        }
+
+        if !prompts.isEmpty {
+            return prompts
+        }
+
+        return normalized
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func loadVocabSize(configuration: ModelConfiguration, hub: HubApi) -> Int? {
+        let configURL = configuration.modelDirectory(hub: hub).appending(component: "config.json")
+        guard let data = try? Data(contentsOf: configURL),
+            let json = try? JSONSerialization.jsonObject(with: data)
+        else {
+            return nil
+        }
+        return extractVocabSize(from: json)
+    }
+
+    private func extractVocabSize(from value: Any) -> Int? {
+        if let intValue = value as? Int {
+            return intValue
+        }
+
+        if let doubleValue = value as? Double {
+            return Int(doubleValue)
+        }
+
+        if let dict = value as? [String: Any] {
+            let preferredKeys = [
+                "vocab_size",
+                "text_vocab_size",
+                "vocabulary_size",
+                "tokenizer_vocab_size",
+                "vocab_size_per_layer_input",
+            ]
+            for key in preferredKeys {
+                if let entry = dict[key], let size = extractVocabSize(from: entry) {
+                    return size
+                }
+            }
+            for (_, nested) in dict {
+                if let size = extractVocabSize(from: nested) {
+                    return size
+                }
+            }
+        }
+
+        if let array = value as? [Any] {
+            for element in array {
+                if let size = extractVocabSize(from: element) {
+                    return size
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private func makeRandomPrompts(batchSize: Int, promptLength: Int, vocabSize: Int) -> [[Int]] {
+        guard batchSize > 0, promptLength > 0 else {
+            return []
+        }
+
+        let tokens = MLXRandom.randInt(0 ..< vocabSize, [batchSize, promptLength])
+        tokens.eval()
+        let flat: [Int32] = tokens.asArray(Int32.self)
+
+        var prompts: [[Int]] = []
+        prompts.reserveCapacity(batchSize)
+
+        let strideLength = promptLength
+        for row in 0..<batchSize {
+            let start = row * strideLength
+            let end = start + strideLength
+            let slice = flat[start..<end].map { Int($0) }
+            prompts.append(slice)
+        }
+
+        return prompts
+    }
+
+    private func encodePrompts(
+        _ prompts: [String],
+        tokenizer: Tokenizer,
+        applyChatTemplate: Bool,
+        systemPrompt: String?
+    ) throws -> [[Int]] {
+        if applyChatTemplate {
+            return try prompts.map { prompt in
+                var messages: [[String: String]] = []
+                if let systemPrompt, !systemPrompt.isEmpty {
+                    messages.append(["role": "system", "content": systemPrompt])
+                }
+                messages.append(["role": "user", "content": prompt])
+                return try tokenizer.applyChatTemplate(messages: messages)
+            }
+        } else {
+            return prompts.map { tokenizer.encode(text: $0) }
+        }
+    }
+
+    private func runBatch(
+        context: ModelContext,
+        prompts: [[Int]],
+        maxTokens: [Int],
+        parameters: BatchGenerateParameters
+    ) throws -> BatchGenerateStats {
+        var stopTokens = Set<Int>()
+        if let eos = context.tokenizer.eosTokenId {
+            stopTokens.insert(eos)
+        }
+        for token in context.configuration.extraEOSTokens {
+            if let id = context.tokenizer.convertTokenToId(token) {
+                stopTokens.insert(id)
+            }
+        }
+
+        var iterator = BatchTokenIterator(
+            model: context.model,
+            parameters: parameters,
+            stopTokens: stopTokens,
+            unknownTokenId: context.tokenizer.unknownTokenId
+        )
+
+        _ = iterator.insert(prompts: prompts, maxTokens: maxTokens)
+
+        while let responses = iterator.next(), !responses.isEmpty {
+            for response in responses {
+                response.logProbs.eval()
+            }
+        }
+
+        Stream().synchronize()
+        return iterator.stats()
+    }
+
+    private func runStream(
+        context: ModelContext,
+        prompt: [Int],
+        parameters: GenerateParameters
+    ) throws -> BatchGenerateStats {
+        let input = LMInput(tokens: MLXArray(prompt))
+        let info = try MLXLMCommon.generate(
+            input: input,
+            parameters: parameters,
+            context: context,
+            didGenerate: { (_: Int) -> GenerateDisposition in .more }
+        )
+
+        return BatchGenerateStats(
+            promptTokenCount: info.promptTokenCount,
+            promptTime: info.promptTime,
+            generationTokenCount: info.generationTokenCount,
+            generationTime: info.generateTime,
+            peakMemoryGB: Double(GPU.peakMemory) / 1_000_000_000.0
+        )
+    }
+
+    private func averageStats(_ stats: [BatchGenerateStats])
+        -> (promptTPS: Double, generationTPS: Double, peakMemory: Double)?
+    {
+        guard !stats.isEmpty else {
+            return nil
+        }
+
+        let count = Double(stats.count)
+        let promptTPS = stats.reduce(0) { $0 + $1.promptTokensPerSecond } / count
+        let generationTPS = stats.reduce(0) { $0 + $1.generationTokensPerSecond } / count
+        let peakMemory = stats.reduce(0) { $0 + $1.peakMemoryGB } / count
+
+        return (promptTPS, generationTPS, peakMemory)
+    }
+
+    private func format(_ value: Double) -> String {
+        String(format: "%.3f", value)
     }
 }
 

@@ -1700,6 +1700,12 @@ public class CacheList: BaseKVCache {
                 batchCache.filter(batchIndices: batchIndices)
             } else if let rotatingCache = cache as? BatchRotatingKVCache {
                 rotatingCache.filter(batchIndices: batchIndices)
+            } else if let arraysCache = cache as? ArraysCache {
+                arraysCache.filter(batchIndices: batchIndices)
+            } else if let listCache = cache as? CacheList {
+                listCache.filter(batchIndices: batchIndices)
+            } else {
+                fatalError("\(type(of: cache)) does not support batched filtering")
             }
         }
     }
@@ -1711,6 +1717,12 @@ public class CacheList: BaseKVCache {
                 lhs.extend(other: rhs)
             } else if let lhs = c as? BatchRotatingKVCache, let rhs = o as? BatchRotatingKVCache {
                 lhs.extend(other: rhs)
+            } else if let lhs = c as? ArraysCache, let rhs = o as? ArraysCache {
+                lhs.extend(other: rhs)
+            } else if let lhs = c as? CacheList, let rhs = o as? CacheList {
+                lhs.extend(other: rhs)
+            } else {
+                fatalError("\(type(of: c)) does not support batched extension")
             }
         }
     }
