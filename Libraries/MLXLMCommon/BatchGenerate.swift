@@ -332,10 +332,11 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
         currentBatch.cache = cache
         asyncEval(nextTokens, nextLogProbs)
 
-        // Synchronize only when we need to read the results
-        // This allows GPU to work on next iteration while CPU processes current results
+        // Materialize tokens to CPU - this synchronizes with GPU
         let tokenArray = previousTokens.asArray(Int.self)
 
+        // Measure time AFTER materialization (matches Python: y.tolist() then perf_counter())
+        let toc = Date.timeIntervalSinceReferenceDate
 
         var responses: [Response] = []
         var keepIndices: [Int] = []
@@ -370,7 +371,6 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
         currentBatch.logProbs = nextLogProbs
 
         generationTokenCount += responses.count
-        let toc = Date.timeIntervalSinceReferenceDate
         generationTime += toc - tic
 
         if !endIndices.isEmpty {

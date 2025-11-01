@@ -431,40 +431,16 @@ struct BenchmarkCommand: AsyncParsableCommand {
                 }
             }()
 
-            print("Running warmup..")
-            switch benchmark.mode {
-            case .batch:
-                _ = try runBatch(
-                    context: context,
-                    prompts: tokenPrompts,
-                    maxTokens: maxTokens,
-                    parameters: batchParameters
-                )
-            case .stream:
-                guard let firstPrompt = tokenPrompts.first else {
-                    throw ValidationError("Stream mode requires at least one prompt")
-                }
-                _ = try runStream(
-                    context: context,
-                    prompt: firstPrompt,
-                    parameters: generationParameters
-                )
-            }
-            GPU.clearCache()
+            // Match Python's wired_limit context manager: temporarily raise Metal memory limit
+            // Python: old_limit = mx.set_wired_limit(max_rec_size)
+            let deviceInfo = GPU.deviceInfo()
+            let maxRecommendedSize = Int(deviceInfo.maxRecommendedWorkingSetSize)
 
-            let reportedBatchSize = benchmark.mode == .stream ? 1 : tokenPrompts.count
-            print(
-                "Timing with promptTokens=\(promptSummaryLength), generationTokens=\(benchmark.generationTokens), batchSize=\(reportedBatchSize)."
-            )
-
-            var trials: [BatchGenerateStats] = []
-            trials.reserveCapacity(benchmark.numTrials)
-
-            for trialIndex in 0..<benchmark.numTrials {
-                let stats: BatchGenerateStats
+            try GPU.withWiredLimit(maxRecommendedSize) {
+                print("Running warmup..")
                 switch benchmark.mode {
                 case .batch:
-                    stats = try runBatch(
+                    _ = try runBatch(
                         context: context,
                         prompts: tokenPrompts,
                         maxTokens: maxTokens,
@@ -474,18 +450,49 @@ struct BenchmarkCommand: AsyncParsableCommand {
                     guard let firstPrompt = tokenPrompts.first else {
                         throw ValidationError("Stream mode requires at least one prompt")
                     }
-                    stats = try runStream(
+                    _ = try runStream(
                         context: context,
                         prompt: firstPrompt,
                         parameters: generationParameters
                     )
                 }
-
-                trials.append(stats)
-                print(
-                    "Trial \(trialIndex + 1):  prompt_tps=\(format(stats.promptTokensPerSecond)), generation_tps=\(format(stats.generationTokensPerSecond)), peak_memory=\(format(stats.peakMemoryGB))"
-                )
                 GPU.clearCache()
+
+                let reportedBatchSize = benchmark.mode == .stream ? 1 : tokenPrompts.count
+                print(
+                    "Timing with promptTokens=\(promptSummaryLength), generationTokens=\(benchmark.generationTokens), batchSize=\(reportedBatchSize)."
+                )
+
+                var trials: [BatchGenerateStats] = []
+                trials.reserveCapacity(benchmark.numTrials)
+
+                for trialIndex in 0..<benchmark.numTrials {
+                    let stats: BatchGenerateStats
+                    switch benchmark.mode {
+                    case .batch:
+                        stats = try runBatch(
+                            context: context,
+                            prompts: tokenPrompts,
+                            maxTokens: maxTokens,
+                            parameters: batchParameters
+                        )
+                    case .stream:
+                        guard let firstPrompt = tokenPrompts.first else {
+                            throw ValidationError("Stream mode requires at least one prompt")
+                        }
+                        stats = try runStream(
+                            context: context,
+                            prompt: firstPrompt,
+                            parameters: generationParameters
+                        )
+                    }
+
+                    trials.append(stats)
+                    print(
+                        "Trial \(trialIndex + 1):  prompt_tps=\(format(stats.promptTokensPerSecond)), generation_tps=\(format(stats.generationTokensPerSecond)), peak_memory=\(format(stats.peakMemoryGB))"
+                    )
+                    GPU.clearCache()
+                }
             }
 
             if let averages = averageStats(trials) {
