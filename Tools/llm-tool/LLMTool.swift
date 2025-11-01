@@ -407,8 +407,9 @@ struct BenchmarkCommand: AsyncParsableCommand {
             }
 
             let effectiveBatchSize = benchmark.mode == .stream ? 1 : tokenPrompts.count
-            let completionBatchSize = max(effectiveBatchSize, 1)
-            let prefillBatchSize = max(1, min(8, completionBatchSize))
+            // Match Python's default completion_batch_size=32 for fair benchmark comparison
+            let completionBatchSize = 32
+            let prefillBatchSize = 8
 
             var generationParameters = GenerateParameters(maxTokens: benchmark.generationTokens)
             generationParameters.temperature = 0.0
@@ -646,15 +647,9 @@ extension BenchmarkCommand {
         maxTokens: [Int],
         parameters: BatchGenerateParameters
     ) throws -> BatchGenerateStats {
-        var stopTokens = Set<Int>()
-        if let eos = context.tokenizer.eosTokenId {
-            stopTokens.insert(eos)
-        }
-        for token in context.configuration.extraEOSTokens {
-            if let id = context.tokenizer.convertTokenToId(token) {
-                stopTokens.insert(id)
-            }
-        }
+        // Match Python benchmark: disable EOS tokens to avoid early stopping
+        // Python does: tokenizer._eos_token_ids = {}
+        let stopTokens = Set<Int>()
 
         var iterator = BatchTokenIterator(
             model: context.model,

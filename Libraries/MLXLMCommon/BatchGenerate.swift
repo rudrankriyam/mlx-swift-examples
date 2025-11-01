@@ -357,7 +357,7 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
                 keepIndices.append(idx)
             }
 
-            let logProbRow = previousLogProbs[idx, 0...]
+            let logProbRow = previousLogProbs[idx]
             responses.append(
                 Response(
                     uid: currentBatch.uids[idx],

@@ -33,43 +33,78 @@ struct ContentView: View {
 
                     Text(llm.stat)
                 }
-                HStack {
-                    Toggle(isOn: $llm.includeWeatherTool) {
-                        Text("Include tools")
-                    }
-                    .frame(maxWidth: 150, alignment: .leading)
-                    Toggle(isOn: $llm.enableThinking) {
-                        Text("Thinking")
-                            .help(
-                                "Switches between thinking and non-thinking modes. Support: Qwen3")
-                    }
-                    .frame(maxWidth: 150, alignment: .leading)
-                    Toggle(isOn: $useBatchMode) {
-                        Text("Batch Mode")
-                            .help(
-                                "Generate responses for multiple prompts in parallel. Enter prompts separated by newlines.")
-                    }
-                    .frame(maxWidth: 150, alignment: .leading)
-                    Spacer()
-                    if llm.running {
-                        ProgressView()
-                            .frame(maxHeight: 20)
-                        Spacer()
-                    }
-                    Picker("", selection: $selectedDisplayStyle) {
-                        ForEach(displayStyle.allCases, id: \.self) { option in
-                            Text(option.rawValue.capitalized)
-                                .tag(option)
+                #if os(iOS)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Toggle(isOn: $llm.includeWeatherTool) {
+                            Text("Include tools")
                         }
+                        Toggle(isOn: $llm.enableThinking) {
+                            Text("Thinking")
+                                .help(
+                                    "Switches between thinking and non-thinking modes. Support: Qwen3")
+                        }
+                        Toggle(isOn: $useBatchMode) {
+                            Text("Batch Mode")
+                                .help(
+                                    "Generate responses for multiple prompts in parallel. Enter prompts separated by newlines.")
+                        }
+                        HStack {
+                            Spacer()
+                            if llm.running {
+                                ProgressView()
+                                    .frame(maxHeight: 20)
+                                Spacer()
+                            }
+                            Picker("", selection: $selectedDisplayStyle) {
+                                ForEach(displayStyle.allCases, id: \.self) { option in
+                                    Text(option.rawValue.capitalized)
+                                        .tag(option)
+                                }
 
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(maxWidth: 150)
+                        }
                     }
-                    .pickerStyle(.segmented)
-                    #if os(visionOS)
-                        .frame(maxWidth: 250)
-                    #else
-                        .frame(maxWidth: 150)
-                    #endif
-                }
+                #else
+                    HStack {
+                        Toggle(isOn: $llm.includeWeatherTool) {
+                            Text("Include tools")
+                        }
+                        .frame(maxWidth: 150, alignment: .leading)
+                        Toggle(isOn: $llm.enableThinking) {
+                            Text("Thinking")
+                                .help(
+                                    "Switches between thinking and non-thinking modes. Support: Qwen3")
+                        }
+                        .frame(maxWidth: 150, alignment: .leading)
+                        Toggle(isOn: $useBatchMode) {
+                            Text("Batch Mode")
+                                .help(
+                                    "Generate responses for multiple prompts in parallel. Enter prompts separated by newlines.")
+                        }
+                        .frame(maxWidth: 150, alignment: .leading)
+                        Spacer()
+                        if llm.running {
+                            ProgressView()
+                                .frame(maxHeight: 20)
+                            Spacer()
+                        }
+                        Picker("", selection: $selectedDisplayStyle) {
+                            ForEach(displayStyle.allCases, id: \.self) { option in
+                                Text(option.rawValue.capitalized)
+                                    .tag(option)
+                            }
+
+                        }
+                        .pickerStyle(.segmented)
+                        #if os(visionOS)
+                            .frame(maxWidth: 250)
+                        #else
+                            .frame(maxWidth: 150)
+                        #endif
+                    }
+                #endif
             }
 
             // show the model output
