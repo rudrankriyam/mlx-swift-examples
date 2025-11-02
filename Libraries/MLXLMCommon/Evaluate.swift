@@ -409,9 +409,13 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
         self.state = result.state
 
-        // Note: KV cache quantization handled in prepare(), not here
-        // Python's _step() doesn't quantize on every token - only during prefill
-        // This matches Python's behavior and eliminates 1000+ unnecessary function calls
+        // Apply dynamic cache quantization after each step
+        maybeQuantizeKVCache(
+            cache: &cache,
+            kvBits: kvBits,
+            kvGroupSize: kvGroupSize,
+            quantizedKVStart: quantizedKVStart
+        )
 
         return convertToToken(logits: result.logits)
     }
@@ -626,12 +630,14 @@ public func generate(
         }
     }
 
-    // TokenIterator uses `asyncEval()` to keep the pipeline full. Synchronize with the stream
-    // BEFORE timing to ensure all GPU work is complete (matches Python's behavior)
-    Stream().synchronize()
-
     let now = Date.timeIntervalSinceReferenceDate
     let generateTime = now - start
+
+    // TokenIterator uses `asyncEval()` to keep the pipeline full. If the caller
+    // exits the program right away, those tasks will still be executing and will
+    // hit assertions as the mlx scheduler is torn down. Synchronize with the stream
+    // to make sure it is complete.
+    Stream().synchronize()
 
     return GenerateResult(
         inputText: input.text, tokens: tokens,
