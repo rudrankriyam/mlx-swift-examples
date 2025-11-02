@@ -515,7 +515,68 @@ class LLMEvaluator {
                     generation: batchGenParams
                 )
 
-                // Use streaming batch generation
+                // For single prompt, use normal streaming (much faster)
+                if prompts.count == 1 {
+                    let messages = [[
+                        "role": "user",
+                        "content": prompts[0]
+                    ]]
+                    let tokens = try context.tokenizer.applyChatTemplate(messages: messages)
+                    let input = LMInput(tokens: MLXArray(tokens))
+
+                    var output = ""
+                    var tokenCount = 0
+
+                    // Initialize batch results
+                    Task { @MainActor in
+                        self.batchResults = [BatchResult(
+                            prompt: prompts[0],
+                            response: "",
+                            tokenCount: 0,
+                            finishReason: "generating"
+                        )]
+                    }
+
+                    for try await item in try MLXLMCommon.generate(
+                        input: input,
+                        parameters: batchGenParams,
+                        context: context
+                    ) {
+                        switch item {
+                        case .chunk(let string):
+                            output += string
+                            tokenCount += 1
+
+                            // Update UI
+                            Task { @MainActor in
+                                self.batchResults = [BatchResult(
+                                    prompt: prompts[0],
+                                    response: output,
+                                    tokenCount: tokenCount,
+                                    finishReason: "generating"
+                                )]
+                            }
+
+                        case .info:
+                            // Final update
+                            Task { @MainActor in
+                                self.batchResults = [BatchResult(
+                                    prompt: prompts[0],
+                                    response: output,
+                                    tokenCount: tokenCount,
+                                    finishReason: "completed"
+                                )]
+                            }
+
+                        case .toolCall:
+                            break
+                        }
+                    }
+
+                    return
+                }
+
+                // Use streaming batch generation for multiple prompts
                 // Apply chat template to each prompt
                 let tokenized: [[Int]] = try prompts.map { prompt in
                     let messages = [[
@@ -588,9 +649,6 @@ class LLMEvaluator {
                             )
                         }
                     }
-
-                    // Small delay to batch UI updates
-                    try? await Task.sleep(for: .milliseconds(50))
                 }
 
                 Stream().synchronize()
