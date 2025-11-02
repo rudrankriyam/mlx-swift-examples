@@ -189,8 +189,13 @@ private class Attention: Module {
         keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        queries = applyRoPE(queries, cache: cache, rope: rope.callAsFunction)
-        keys = applyRoPE(keys, cache: cache, rope: rope.callAsFunction)
+        if let cache {
+            queries = rope(queries, offset: cache.offset)
+            keys = rope(keys, offset: cache.offset)
+        } else {
+            queries = rope(queries)
+            keys = rope(keys)
+        }
 
         let output = attentionWithCacheUpdate(
             queries: queries,
