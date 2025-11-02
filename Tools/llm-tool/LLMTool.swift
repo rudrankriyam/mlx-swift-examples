@@ -468,7 +468,9 @@ struct BenchmarkCommand: AsyncParsableCommand {
 
                 for trialIndex in 0..<benchmark.numTrials {
                     let stats: BatchGenerateStats
-                    switch benchmark.mode {
+                    // Match Python: automatically use stream mode for batch_size=1
+                    let effectiveMode = benchmark.batchSize == 1 ? .stream : benchmark.mode
+                    switch effectiveMode {
                     case .batch:
                         stats = try runBatch(
                             context: context,
