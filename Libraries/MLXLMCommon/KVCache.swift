@@ -1046,10 +1046,9 @@ public class BatchKVCache: BaseKVCache {
         // Update per-batch offsets
         offsets = offsets + MLXArray(tokenCount)
 
-        // For batch mode, set self.offset to the maximum offset value
-        // This is used by models that don't yet support per-batch offsets
-        let maxOffset = offsets.max().item(Int.self)
-        self.offset = maxOffset
+        // For batch mode, set self.offset based on currentLength
+        // Python tracks this as self._idx, avoiding GPU sync
+        self.offset = currentLength
 
         self.keys?[.ellipsis, previous ..< currentLength, 0...] = keys
         self.values?[.ellipsis, previous ..< currentLength, 0...] = values
