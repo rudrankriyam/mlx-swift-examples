@@ -127,7 +127,7 @@ fileprivate struct PendingPrompt {
     var length: Int { tokens.count }
 }
 
-fileprivate struct ActiveBatch {
+fileprivate final class ActiveBatch {
     var uids: [Int]
     var tokens: MLXArray
     var logProbs: MLXArray
@@ -137,7 +137,23 @@ fileprivate struct ActiveBatch {
 
     var count: Int { uids.count }
 
-    mutating func filter(keeping indices: [Int]) {
+    init(
+        uids: [Int],
+        tokens: MLXArray,
+        logProbs: MLXArray,
+        maxTokens: [Int],
+        numTokens: [Int],
+        cache: [KVCache]
+    ) {
+        self.uids = uids
+        self.tokens = tokens
+        self.logProbs = logProbs
+        self.maxTokens = maxTokens
+        self.numTokens = numTokens
+        self.cache = cache
+    }
+
+    func filter(keeping indices: [Int]) {
         let keepIndices = MLXArray(indices.map(Int32.init))
         uids = indices.map { uids[$0] }
         maxTokens = indices.map { maxTokens[$0] }
@@ -162,7 +178,7 @@ fileprivate struct ActiveBatch {
         }
     }
 
-    mutating func extend(_ other: ActiveBatch) {
+    func extend(_ other: ActiveBatch) {
         uids.append(contentsOf: other.uids)
         maxTokens.append(contentsOf: other.maxTokens)
         numTokens.append(contentsOf: other.numTokens)
@@ -289,7 +305,7 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
                 }
             }
 
-            if var existing = batch, !promptProcessing {
+            if let existing = batch, !promptProcessing {
                 eval(existing.tokens, existing.logProbs)
                 let now = Date.timeIntervalSinceReferenceDate
                 generationTime += now - tic
@@ -300,9 +316,8 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
             unprocessedPrompts.removeFirst(chunk.count)
             promptProcessing = true
 
-            if var current = batch {
+            if let current = batch {
                 current.extend(newBatch)
-                batch = current
             } else {
                 batch = newBatch
             }
@@ -311,7 +326,7 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
             numToAdd = Swift.max(parameters.completionBatchSize - numActive, 0)
         }
 
-        guard var currentBatch = batch ?? activeBatch else {
+        guard let currentBatch = batch ?? activeBatch else {
             return []
         }
 
@@ -332,6 +347,7 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
         asyncEval(nextTokens, nextLogProbs)
 
         // Materialize tokens to CPU - this synchronizes with GPU
+        // Match Python: y.tolist() converts entire array at once
         let tokenArray = previousTokens.asArray(Int.self)
 
         // Measure time AFTER materialization (matches Python: y.tolist() then perf_counter())
@@ -443,13 +459,7 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
         cache: inout [KVCache]
     ) -> (MLXArray, MLXArray) {
         let logits = model(inputTokens, cache: cache)
-        var selected = logits[0..., -1, 0...]
-
-        maybeQuantizeKVCache(
-            cache: &cache,
-            kvBits: kvBits,
-            kvGroupSize: kvGroupSize,
-            quantizedKVStart: quantizedKVStart)
+        let selected = logits[0..., -1, 0...]
 
         let logSum = logSumExp(selected, axis: selected.ndim - 1, keepDims: true)
         let logProbs = selected - logSum
