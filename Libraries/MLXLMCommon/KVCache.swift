@@ -1044,7 +1044,7 @@ public class BatchKVCache: BaseKVCache {
         currentLength += tokenCount
 
         // Update per-batch offsets
-        offsets = offsets + MLXArray(tokenCount)
+        offsets = offsets + tokenCount
 
         // For batch mode, set self.offset based on currentLength
         // Python tracks this as self._idx, avoiding GPU sync
@@ -1155,7 +1155,7 @@ public class BatchKVCache: BaseKVCache {
         if trimmed == 0 { return 0 }
         currentLength -= trimmed
         self.offset = currentLength
-        offsets = offsets - MLXArray(trimmed)
+        offsets = offsets - trimmed
         return trimmed
     }
 
