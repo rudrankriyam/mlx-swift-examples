@@ -330,12 +330,6 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
             return []
         }
 
-        if promptProcessing {
-            let now = Date.timeIntervalSinceReferenceDate
-            promptTime += now - tic
-            tic = now
-        }
-
         // Store references to previous iteration's results
         let previousTokens = currentBatch.tokens
         let previousLogProbs = currentBatch.logProbs
@@ -352,6 +346,13 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
 
         // Measure time AFTER materialization (matches Python: y.tolist() then perf_counter())
         let toc = Date.timeIntervalSinceReferenceDate
+
+        // Python: if prompt_processing: prompt_time += toc - tic else: generation_time += toc - tic
+        if promptProcessing {
+            promptTime += toc - tic
+        } else {
+            generationTime += toc - tic
+        }
 
         var responses: [Response] = []
         var keepIndices: [Int] = []
@@ -386,7 +387,6 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
         currentBatch.logProbs = nextLogProbs
 
         generationTokenCount += responses.count
-        generationTime += toc - tic
 
         if !endIndices.isEmpty {
             if keepIndices.isEmpty {
