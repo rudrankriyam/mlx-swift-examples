@@ -515,6 +515,7 @@ class LLMEvaluator {
                     generation: batchGenParams
                 )
 
+                /* Yeah I think not
                 // For single prompt, use normal streaming (much faster)
                 if prompts.count == 1 {
                     let messages = [[
@@ -575,7 +576,8 @@ class LLMEvaluator {
 
                     return
                 }
-
+                 */
+                 
                 // Use streaming batch generation for multiple prompts
                 // Apply chat template to each prompt
                 let tokenized: [[Int]] = try prompts.map { prompt in

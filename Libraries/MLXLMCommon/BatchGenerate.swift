@@ -59,12 +59,16 @@ public struct BatchGenerateParameters: Sendable {
     /// Underlying single-sequence generation parameters (sampling, quantization, etc.).
     public var generation: GenerateParameters
 
+    /// Whether to return log probabilities for each generated token.
+    public var returnLogProbs: Bool
+
     public init(
         maxTokens: Int = 128,
         completionBatchSize: Int = 32,
         prefillBatchSize: Int = 8,
         prefillStepSize: Int = 2_048,
-        generation: GenerateParameters = .init()
+        generation: GenerateParameters = .init(),
+        returnLogProbs: Bool = true
     ) {
         self.defaultMaxTokens = maxTokens
         self.completionBatchSize = completionBatchSize
@@ -76,6 +80,7 @@ public struct BatchGenerateParameters: Sendable {
             generationParameters.maxTokens = maxTokens
         }
         self.generation = generationParameters
+        self.returnLogProbs = returnLogProbs
     }
 }
 
@@ -119,10 +124,32 @@ public struct BatchGenerateResult: Sendable {
     }
 }
 
+fileprivate struct LogitProcessorBox: Sendable {
+    private var processor: any LogitProcessor
+
+    init(_ processor: any LogitProcessor) {
+        self.processor = processor
+    }
+
+    mutating func prompt(_ prompt: MLXArray) {
+        processor.prompt(prompt)
+    }
+
+    mutating func process(logits: MLXArray) -> MLXArray {
+        processor.process(logits: logits)
+    }
+
+    mutating func didSample(token: MLXArray) {
+        processor.didSample(token: token)
+    }
+}
+
 fileprivate struct PendingPrompt {
     let uid: Int
     let tokens: [Int]
     let maxTokens: Int
+    let sampler: LogitSampler
+    var processor: LogitProcessorBox?
 
     var length: Int { tokens.count }
 }
@@ -130,27 +157,35 @@ fileprivate struct PendingPrompt {
 fileprivate final class ActiveBatch {
     var uids: [Int]
     var tokens: MLXArray
-    var logProbs: MLXArray
+    /// Optional cache of selected logits [B, vocab] from the previous step.
+    /// Present only when returnLogProbs == true to avoid needless bandwidth.
+    var prevSelectedLogits: MLXArray?
     var maxTokens: [Int]
     var numTokens: [Int]
     var cache: [KVCache]
+    var samplers: [LogitSampler]
+    var processors: [LogitProcessorBox?]
 
     var count: Int { uids.count }
 
     init(
         uids: [Int],
         tokens: MLXArray,
-        logProbs: MLXArray,
+        prevSelectedLogits: MLXArray?,
         maxTokens: [Int],
         numTokens: [Int],
-        cache: [KVCache]
+        cache: [KVCache],
+        samplers: [LogitSampler],
+        processors: [LogitProcessorBox?]
     ) {
         self.uids = uids
         self.tokens = tokens
-        self.logProbs = logProbs
+        self.prevSelectedLogits = prevSelectedLogits
         self.maxTokens = maxTokens
         self.numTokens = numTokens
         self.cache = cache
+        self.samplers = samplers
+        self.processors = processors
     }
 
     func filter(keeping indices: [Int]) {
@@ -158,10 +193,14 @@ fileprivate final class ActiveBatch {
         uids = indices.map { uids[$0] }
         maxTokens = indices.map { maxTokens[$0] }
         numTokens = indices.map { numTokens[$0] }
+        samplers = indices.map { samplers[$0] }
+        processors = indices.map { processors[$0] }
 
         tokens = tokens[keepIndices]
-        logProbs = logProbs[keepIndices, .ellipsis]
-
+        if let lp = prevSelectedLogits {
+            prevSelectedLogits = lp[keepIndices, .ellipsis]
+        }
+        
         for i in cache.indices {
             switch cache[i] {
             case let batch as BatchKVCache:
@@ -182,9 +221,18 @@ fileprivate final class ActiveBatch {
         uids.append(contentsOf: other.uids)
         maxTokens.append(contentsOf: other.maxTokens)
         numTokens.append(contentsOf: other.numTokens)
+        samplers.append(contentsOf: other.samplers)
+        processors.append(contentsOf: other.processors)
 
         tokens = MLX.concatenated([tokens, other.tokens])
-        logProbs = MLX.concatenated([logProbs, other.logProbs])
+        switch (prevSelectedLogits, other.prevSelectedLogits) {
+        case let (lhs?, rhs?):
+            prevSelectedLogits = MLX.concatenated([lhs, rhs])
+        case (nil, nil):
+            prevSelectedLogits = nil
+        default:
+            fatalError("ActiveBatch.extend: returnLogProbs presence mismatch between batches")
+        }
 
         for i in cache.indices {
             switch (cache[i], other.cache[i]) {
@@ -227,12 +275,13 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
 
     private var model: any LanguageModel
     private let parameters: BatchGenerateParameters
-    private let sampler: LogitSampler
+    private let defaultSampler: LogitSampler
     private let kvBits: Int?
     private let kvGroupSize: Int
     private let quantizedKVStart: Int
     private let stopTokens: Set<Int>
     private let unknownTokenId: Int?
+    private let returnLogProbs: Bool
 
     private var unprocessedPrompts: [PendingPrompt] = []
     private var activeBatch: ActiveBatch?
@@ -251,33 +300,78 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
     ) {
         self.model = model
         self.parameters = parameters
-        self.sampler = parameters.generation.sampler()
+        self.defaultSampler = parameters.generation.sampler()
         self.kvBits = parameters.generation.kvBits
         self.kvGroupSize = parameters.generation.kvGroupSize
         self.quantizedKVStart = parameters.generation.quantizedKVStart
         self.stopTokens = stopTokens
         self.unknownTokenId = unknownTokenId
+        self.returnLogProbs = parameters.returnLogProbs
     }
 
     @discardableResult
-    public mutating func insert(prompts: [[Int]], maxTokens: [Int]? = nil) -> [Int] {
+    public mutating func insert(
+        prompts: [[Int]],
+        maxTokens: [Int]? = nil,
+        samplers: [LogitSampler]? = nil,
+        processors: [LogitProcessor?]? = nil
+    ) -> [Int] {
         guard maxTokens == nil || maxTokens!.count == prompts.count else {
             fatalError("maxTokens.count must match prompts.count")
+        }
+
+        if let samplers, samplers.count != prompts.count {
+            fatalError("samplers.count must match prompts.count")
+        }
+
+        if let processors, processors.count != prompts.count {
+            fatalError("processors.count must match prompts.count")
         }
 
         let resolvedMaxTokens: [Int] = maxTokens ?? Array(
             repeating: parameters.defaultMaxTokens, count: prompts.count)
 
         var assigned = [Int]()
-        for (tokens, limit) in zip(prompts, resolvedMaxTokens) {
+        for (index, element) in prompts.enumerated() {
+            let tokens = element
+            let limit = resolvedMaxTokens[index]
             let uid = uidCounter
             uidCounter += 1
-            unprocessedPrompts.append(.init(uid: uid, tokens: tokens, maxTokens: limit))
+            let sampler = samplers?[index] ?? defaultSampler
+            var processorBox: LogitProcessorBox?
+            if let processor = processors?[index] ?? parameters.generation.processor() {
+                processorBox = LogitProcessorBox(processor)
+            }
+            unprocessedPrompts.append(
+                .init(uid: uid, tokens: tokens, maxTokens: limit, sampler: sampler, processor: processorBox)
+            )
             assigned.append(uid)
         }
 
         unprocessedPrompts.sort { $0.length < $1.length }
         return assigned
+    }
+
+    public mutating func remove(uids: some Sequence<Int>) {
+        let removal = Set(uids)
+        guard !removal.isEmpty else { return }
+
+        unprocessedPrompts.removeAll { removal.contains($0.uid) }
+
+        if let current = activeBatch {
+            let keep = current.uids.enumerated().compactMap { index, uid in
+                removal.contains(uid) ? nil : index
+            }
+
+            if keep.count != current.uids.count {
+                if keep.isEmpty {
+                    activeBatch = nil
+                } else {
+                    current.filter(keeping: keep)
+                    activeBatch = current
+                }
+            }
+        }
     }
 
     public mutating func next() -> [Response]? {
@@ -306,7 +400,11 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
             }
 
             if let existing = batch, !promptProcessing {
-                eval(existing.tokens, existing.logProbs)
+                if let lp = existing.prevSelectedLogits {
+                    eval(existing.tokens, lp)
+                } else {
+                    eval(existing.tokens)
+                }
                 let now = Date.timeIntervalSinceReferenceDate
                 generationTime += now - tic
                 tic = now
@@ -332,13 +430,18 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
 
         // Store references to previous iteration's results
         let previousTokens = currentBatch.tokens
-        let previousLogProbs = currentBatch.logProbs
+        let previousSelected = currentBatch.prevSelectedLogits // may be nil
 
         // Compute next iteration's tokens asynchronously
         // Mutate cache in-place to avoid copy-on-write overhead
-        let (nextTokens, nextLogProbs) = step(
-            inputTokens: previousTokens[0..., .newAxis], cache: &currentBatch.cache)
-        asyncEval(nextTokens, nextLogProbs)
+        var processors = currentBatch.processors
+        let (nextTokens, nextSelected) = step(
+            inputTokens: previousTokens[0..., .newAxis],
+            cache: &currentBatch.cache,
+            samplers: currentBatch.samplers,
+            processors: &processors)
+        currentBatch.processors = processors
+        if let s = nextSelected { asyncEval(nextTokens, s) } else { asyncEval(nextTokens) }
 
         // Materialize tokens to CPU - this synchronizes with GPU
         // Match Python: y.tolist() converts entire array at once
@@ -357,6 +460,10 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
         var responses: [Response] = []
         var keepIndices: [Int] = []
         var endIndices: [Int] = []
+        
+        responses.reserveCapacity(tokenArray.count)
+        keepIndices.reserveCapacity(tokenArray.count)
+        endIndices.reserveCapacity(4)
 
         for idx in 0 ..< tokenArray.count {
             var finish: BatchGenerateResult.FinishReason? = nil
@@ -374,7 +481,12 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
                 keepIndices.append(idx)
             }
 
-            let logProbRow = previousLogProbs[idx]
+            let logProbRow: MLXArray
+            if returnLogProbs, let sel = previousSelected {
+                logProbRow = normalizeLogProbsRow(sel[idx])
+            } else {
+                logProbRow = MLXArray([])
+            }
             responses.append(
                 Response(
                     uid: currentBatch.uids[idx],
@@ -384,7 +496,7 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
         }
 
         currentBatch.tokens = nextTokens
-        currentBatch.logProbs = nextLogProbs
+        currentBatch.prevSelectedLogits = nextSelected
 
         generationTokenCount += responses.count
 
@@ -423,6 +535,14 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
         var cache = makeBatchCache(
             model: model, parameters: parameters, leftPadding: leftPadding)
 
+        var processors = prompts.map(\.processor)
+        for index in processors.indices {
+            if var processor = processors[index] {
+                processor.prompt(MLXArray(tokens[index]))
+                processors[index] = processor
+            }
+        }
+
         var remaining = padded
         while remaining.dim(1) > 1 {
             let nToProcess = Swift.min(parameters.prefillStepSize, remaining.dim(1) - 1)
@@ -442,31 +562,68 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
             GPU.clearCache()
         }
 
-        let (y, logProbs) = step(inputTokens: remaining, cache: &cache)
-        asyncEval(y, logProbs)
+        let samplers = prompts.map(\.sampler)
+
+        let (y, maybeSelected) = step(
+            inputTokens: remaining,
+            cache: &cache,
+            samplers: samplers,
+            processors: &processors)
+        if let s = maybeSelected { asyncEval(y, s) } else { asyncEval(y) }
 
         return ActiveBatch(
             uids: prompts.map(\.uid),
             tokens: y,
-            logProbs: logProbs,
+            prevSelectedLogits: maybeSelected,
             maxTokens: prompts.map(\.maxTokens),
             numTokens: Array(repeating: 0, count: prompts.count),
-            cache: cache)
+            cache: cache,
+            samplers: samplers,
+            processors: processors)
     }
 
     private mutating func step(
         inputTokens: MLXArray,
-        cache: inout [KVCache]
-    ) -> (MLXArray, MLXArray) {
+        cache: inout [KVCache],
+        samplers: [LogitSampler],
+        processors: inout [LogitProcessorBox?]
+    ) -> (MLXArray, MLXArray?) {
         let logits = model(inputTokens, cache: cache)
         let selected = logits[0..., -1, 0...]
 
-        let logSum = logSumExp(selected, axis: selected.ndim - 1, keepDims: true)
-        let logProbs = selected - logSum
+        var sampledTokens = [Int32]()
+        sampledTokens.reserveCapacity(samplers.count)
 
-        let sampled = sampler.sample(logits: selected)
+        for index in 0..<samplers.count {
+            let sampler = samplers[index]
+            var logitsRow = selected[index..<(index + 1), .ellipsis]
 
-        return (sampled, logProbs)
+            if var processor = processors[index] {
+                logitsRow = processor.process(logits: logitsRow)
+                processors[index] = processor
+            }
+
+            let sampledRow = sampler.sample(logits: logitsRow)
+
+            if var processor = processors[index] {
+                processor.didSample(token: sampledRow)
+                processors[index] = processor
+            }
+
+            sampledTokens.append(sampledRow.item(Int32.self))
+        }
+
+        let sampled = MLXArray(sampledTokens)
+        if returnLogProbs {
+            return (sampled, selected)   // carry [B, vocab] only when needed
+        } else {
+            return (sampled, nil)
+        }
+    }
+
+    private func normalizeLogProbsRow(_ row: MLXArray) -> MLXArray {
+        let logSum = logSumExp(row, axis: row.ndim - 1, keepDims: true)
+        return row - logSum
     }
 }
 
@@ -513,9 +670,8 @@ public func batchGenerate(
             if response.finishReason != .stop {
                 generatedTokens[response.uid, default: []].append(response.token)
             }
-            response.logProbs.eval()
+            // Do NOT eval per token; keep device-resident to avoid sync stalls.
             logProbHistory[response.uid, default: []].append(response.logProbs)
-
             if let finish = response.finishReason {
                 finishReasons[response.uid] = finish
             }
