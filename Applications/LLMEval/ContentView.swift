@@ -339,6 +339,7 @@ class LLMEvaluator {
     /// parameters controlling the output
     let generateParameters = GenerateParameters(maxTokens: 500, temperature: 0.6)
     let updateInterval = Duration.seconds(0.25)
+    let continuousStaggerSeconds: Double = 0.5
 
     /// A task responsible for handling the generation process.
     var generationTask: Task<Void, Error>?
@@ -770,13 +771,23 @@ class LLMEvaluator {
                     return try tokenizer.applyChatTemplate(messages: messages)
                 }
 
+                let staggerNanoseconds = UInt64(continuousStaggerSeconds * 1_000_000_000.0)
+
                 Task { @MainActor in
                     self.batchResults = prompts.enumerated().map { (idx, prompt) in
-                        BatchResult(
+                        let delaySeconds = Double(idx) * continuousStaggerSeconds
+                        let status: String
+                        if idx == 0 {
+                            status = "scheduled"
+                        } else {
+                            status = String(format: "queued (%.1fs)", delaySeconds)
+                        }
+
+                        return BatchResult(
                             prompt: prompt,
                             response: "",
                             tokenCount: 0,
-                            finishReason: idx == 0 ? "starting" : "queued"
+                            finishReason: status
                         )
                     }
                 }
@@ -790,6 +801,9 @@ class LLMEvaluator {
                 )
 
                 let scheduler = InferenceScheduler(context: context, config: schedulerConfig)
+                defer {
+                    Task { await scheduler.shutdown() }
+                }
 
                 try await withThrowingTaskGroup(of: Void.self) { group in
                     for (index, tokens) in tokenized.enumerated() {
@@ -797,6 +811,14 @@ class LLMEvaluator {
 
                         group.addTask {
                             if Task.isCancelled { return }
+
+                            if index > 0 {
+                                let delay = UInt64(Double(index) * Double(staggerNanoseconds))
+                                if delay > 0 {
+                                    try await Task.sleep(nanoseconds: delay)
+                                    if Task.isCancelled { return }
+                                }
+                            }
 
                             var requestParameters = baseParameters
                             if requestParameters.maxTokens == nil {
@@ -814,9 +836,23 @@ class LLMEvaluator {
                             var accumulatedText = ""
                             var generatedTokens = 0
                             var finishReason: BatchGenerateResult.FinishReason?
+                            var started = false
 
                             for await event in stream {
                                 if Task.isCancelled { break }
+
+                                if !started {
+                                    started = true
+                                    Task { @MainActor in
+                                        guard index < self.batchResults.count else { return }
+                                        self.batchResults[index] = BatchResult(
+                                            prompt: prompt,
+                                            response: accumulatedText,
+                                            tokenCount: generatedTokens,
+                                            finishReason: "running"
+                                        )
+                                    }
+                                }
 
                                 if let token = event.token {
                                     generatedTokens += 1
@@ -849,7 +885,17 @@ class LLMEvaluator {
                                 }
                             }
 
-                            let finalStatus = finishReason?.rawValue ?? "complete"
+                            let wasCancelled = Task.isCancelled
+                            let finalStatus: String
+                            if let finishReason {
+                                finalStatus = finishReason.rawValue
+                            } else if wasCancelled {
+                                finalStatus = "cancelled"
+                            } else if started {
+                                finalStatus = "complete"
+                            } else {
+                                finalStatus = "cancelled"
+                            }
                             Task { @MainActor in
                                 guard index < self.batchResults.count else { return }
                                 self.batchResults[index] = BatchResult(
@@ -860,10 +906,6 @@ class LLMEvaluator {
                                 )
                             }
                         }
-
-                        if index < tokenized.count - 1 {
-                            try await Task.sleep(for: .seconds(1))
-                        }
                     }
 
                     try await group.waitForAll()
@@ -873,8 +915,6 @@ class LLMEvaluator {
 
                 let aggregated = await scheduler.aggregatedStats()
                 aggregatedStats = aggregated
-
-                await scheduler.shutdown()
             }
 
             if let aggregated = aggregatedStats {
