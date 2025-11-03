@@ -20,7 +20,6 @@ struct ContentView: View {
     }
 
     @State private var selectedDisplayStyle = displayStyle.markdown
-    @State private var useBatchMode = false
 
     var body: some View {
         VStack(alignment: .leading) {
@@ -43,11 +42,13 @@ struct ContentView: View {
                                 .help(
                                     "Switches between thinking and non-thinking modes. Support: Qwen3")
                         }
-                        Toggle(isOn: $useBatchMode) {
-                            Text("Batch Mode")
-                                .help(
-                                    "Generate responses for multiple prompts in parallel. Enter prompts separated by newlines.")
+                        Picker("Mode", selection: Bindable(llm).generationMode) {
+                            ForEach(LLMEvaluator.GenerationMode.allCases) { mode in
+                                Text(mode.title)
+                                    .tag(mode)
+                            }
                         }
+                        .pickerStyle(.segmented)
                         HStack {
                             Spacer()
                             if llm.running {
@@ -78,12 +79,18 @@ struct ContentView: View {
                                     "Switches between thinking and non-thinking modes. Support: Qwen3")
                         }
                         .frame(maxWidth: 150, alignment: .leading)
-                        Toggle(isOn: $useBatchMode) {
-                            Text("Batch Mode")
-                                .help(
-                                    "Generate responses for multiple prompts in parallel. Enter prompts separated by newlines.")
+                        Picker("Mode", selection: Bindable(llm).generationMode) {
+                            ForEach(LLMEvaluator.GenerationMode.allCases) { mode in
+                                Text(mode.title)
+                                    .tag(mode)
+                            }
                         }
-                        .frame(maxWidth: 150, alignment: .leading)
+                        .pickerStyle(.segmented)
+                        #if os(visionOS)
+                            .frame(maxWidth: 250)
+                        #else
+                            .frame(maxWidth: 250)
+                        #endif
                         Spacer()
                         if llm.running {
                             ProgressView()
@@ -108,7 +115,7 @@ struct ContentView: View {
             }
 
             // show the model output
-            if useBatchMode && !llm.batchResults.isEmpty {
+            if llm.isBatchMode && !llm.batchResults.isEmpty {
                 // Side-by-side batch results
                 HStack(spacing: 0) {
                     ForEach(Array(llm.batchResults.enumerated()), id: \.offset) { idx, result in
@@ -185,7 +192,7 @@ struct ContentView: View {
             }
 
             HStack {
-                if useBatchMode {
+                if llm.isBatchMode {
                     ZStack(alignment: .topLeading) {
                         if llm.prompt.isEmpty {
                             Text("Enter multiple prompts, one per line:\nHi\nWhat is quantum computing and why is it important?")
@@ -261,11 +268,7 @@ struct ContentView: View {
     }
 
     private func generate() {
-        if useBatchMode {
-            llm.generateBatch()
-        } else {
-            llm.generate()
-        }
+        llm.generate()
     }
 
     private func cancel() {
@@ -288,6 +291,25 @@ class LLMEvaluator {
 
     var running = false
 
+    enum GenerationMode: String, CaseIterable, Identifiable {
+        case single
+        case batch
+        case continuous
+
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .single:
+                return "Non-batch"
+            case .batch:
+                return "Batched"
+            case .continuous:
+                return "Continuous batch"
+            }
+        }
+    }
+
     // Store batch results for side-by-side display
     struct BatchResult {
         let prompt: String
@@ -296,6 +318,12 @@ class LLMEvaluator {
         let finishReason: String
     }
     var batchResults: [BatchResult] = []
+
+    var generationMode: GenerationMode = .single
+
+    var isBatchMode: Bool {
+        generationMode != .single
+    }
 
     var includeWeatherTool = false
     var enableThinking = false
@@ -461,22 +489,22 @@ class LLMEvaluator {
         guard !running else { return }
         let currentPrompt = prompt
         prompt = ""
-        generationTask = Task {
-            running = true
-            await generate(prompt: currentPrompt)
-            running = false
+        if isBatchMode {
+            batchResults = []
         }
-    }
 
-    func generateBatch() {
-        guard !running else { return }
-        let currentPrompt = prompt
-        prompt = ""
-        batchResults = [] // Clear previous results
         generationTask = Task {
             running = true
-            await generateBatchPrompts(promptText: currentPrompt)
-            running = false
+            defer { running = false }
+
+            switch generationMode {
+            case .single:
+                await generate(prompt: currentPrompt)
+            case .batch:
+                await generateBatchPrompts(promptText: currentPrompt)
+            case .continuous:
+                await generateContinuousBatchPrompts(promptText: currentPrompt)
+            }
         }
     }
 
@@ -702,6 +730,186 @@ class LLMEvaluator {
                 }
             }
 
+        } catch {
+            output = "Failed: \(error)"
+        }
+    }
+
+    private func generateContinuousBatchPrompts(promptText: String) async {
+        self.output = ""
+
+        let prompts = promptText
+            .split(separator: "\n")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !prompts.isEmpty else {
+            self.output = "No prompts provided. Enter prompts separated by newlines."
+            return
+        }
+
+        self.output = "Starting continuous batching for \(prompts.count) prompts...\n\n"
+
+        do {
+            let modelContainer = try await load()
+
+            MLXRandom.seed(UInt64(Date.timeIntervalSinceReferenceDate * 1000))
+
+            var aggregatedStats: AggregatedStats?
+
+            try await modelContainer.perform { (context: ModelContext) -> Void in
+                let tokenizer = context.tokenizer
+                let baseParameters = generateParameters
+                let maxTokens = baseParameters.maxTokens ?? 128
+
+                let tokenized: [[Int]] = try prompts.map { prompt in
+                    let messages = [[
+                        "role": "user",
+                        "content": prompt,
+                    ]]
+                    return try tokenizer.applyChatTemplate(messages: messages)
+                }
+
+                Task { @MainActor in
+                    self.batchResults = prompts.enumerated().map { (idx, prompt) in
+                        BatchResult(
+                            prompt: prompt,
+                            response: "",
+                            tokenCount: 0,
+                            finishReason: idx == 0 ? "starting" : "queued"
+                        )
+                    }
+                }
+
+                let schedulerConfig = SchedulerConfig(
+                    maxConcurrentRequests: min(max(1, prompts.count), 8),
+                    completionBatchSize: 32,
+                    prefillBatchSize: 8,
+                    prefillStepSize: 2_048,
+                    returnLogProbs: false
+                )
+
+                let scheduler = InferenceScheduler(context: context, config: schedulerConfig)
+
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    for (index, tokens) in tokenized.enumerated() {
+                        let prompt = prompts[index]
+
+                        group.addTask {
+                            if Task.isCancelled { return }
+
+                            var requestParameters = baseParameters
+                            if requestParameters.maxTokens == nil {
+                                requestParameters.maxTokens = maxTokens
+                            }
+
+                            let request = InferenceRequest(
+                                tokens: tokens,
+                                params: requestParameters,
+                                maxTokens: requestParameters.maxTokens ?? maxTokens
+                            )
+
+                            let stream = await scheduler.submit(request)
+
+                            var accumulatedText = ""
+                            var generatedTokens = 0
+                            var finishReason: BatchGenerateResult.FinishReason?
+
+                            for await event in stream {
+                                if Task.isCancelled { break }
+
+                                if let token = event.token {
+                                    generatedTokens += 1
+                                }
+
+                                if let delta = event.textDelta, !delta.isEmpty {
+                                    accumulatedText += delta
+                                } else if let token = event.token {
+                                    let fragment = tokenizer.decode(
+                                        tokens: [token],
+                                        skipSpecialTokens: true
+                                    )
+                                    accumulatedText += fragment
+                                }
+
+                                if let reason = event.finishReason {
+                                    finishReason = reason
+                                }
+
+                                let status = finishReason?.rawValue ?? "generating"
+
+                                Task { @MainActor in
+                                    guard index < self.batchResults.count else { return }
+                                    self.batchResults[index] = BatchResult(
+                                        prompt: prompt,
+                                        response: accumulatedText,
+                                        tokenCount: generatedTokens,
+                                        finishReason: status
+                                    )
+                                }
+                            }
+
+                            let finalStatus = finishReason?.rawValue ?? "complete"
+                            Task { @MainActor in
+                                guard index < self.batchResults.count else { return }
+                                self.batchResults[index] = BatchResult(
+                                    prompt: prompt,
+                                    response: accumulatedText,
+                                    tokenCount: generatedTokens,
+                                    finishReason: finalStatus
+                                )
+                            }
+                        }
+
+                        if index < tokenized.count - 1 {
+                            try await Task.sleep(for: .seconds(1))
+                        }
+                    }
+
+                    try await group.waitForAll()
+                }
+
+                Stream().synchronize()
+
+                let aggregated = await scheduler.aggregatedStats()
+                aggregatedStats = aggregated
+
+                await scheduler.shutdown()
+            }
+
+            if let aggregated = aggregatedStats {
+                self.stat = "\(String(format: "%.2f", aggregated.averageTPS)) tokens/s (continuous)"
+            }
+
+            await Task.yield()
+
+            var formattedOutput = "# Continuous Batch Results\n\n"
+            for (idx, batch) in batchResults.enumerated() {
+                formattedOutput += "### Prompt \(idx + 1)\n"
+                formattedOutput += "> \(batch.prompt)\n\n"
+                formattedOutput += "**Response:**\n"
+                formattedOutput += "\(batch.response)\n\n"
+                formattedOutput += "*\(batch.tokenCount) tokens • \(batch.finishReason)*\n\n"
+                if idx < batchResults.count - 1 {
+                    formattedOutput += "---\n\n"
+                }
+            }
+
+            if let aggregated = aggregatedStats {
+                formattedOutput += "---\n\n## 📊 Scheduler Statistics\n\n"
+                formattedOutput += "| Metric | Value |\n"
+                formattedOutput += "|--------|-------|\n"
+                formattedOutput += "| Active Requests | \(aggregated.activeRequests) |\n"
+                formattedOutput += "| Queued Requests | \(aggregated.queuedRequests) |\n"
+                formattedOutput += "| Total Processed | \(aggregated.totalRequestsProcessed) |\n"
+                formattedOutput += "| Average TPS | \(String(format: "%.2f", aggregated.averageTPS)) |\n"
+                formattedOutput += "| Peak Memory (GB) | \(String(format: "%.2f", aggregated.peakMemoryGB)) |\n"
+            }
+
+            self.output = formattedOutput
+
+        } catch is CancellationError {
+            output = "Cancelled"
         } catch {
             output = "Failed: \(error)"
         }
