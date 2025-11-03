@@ -12,6 +12,17 @@ public actor InferenceScheduler {
         var lastEmitAt: TimeInterval?
     }
 
+    private struct SoloPromotion {
+        var requestID: UUID
+        var nextTokens: MLXArray
+        var generatedTokens: Int
+        var sampler: LogitSampler
+        var processor: (any LogitProcessor)?
+        var caches: [KVCache]
+        var maxTokens: Int
+        var promptTokenCount: Int
+    }
+
     private enum Mode {
         case idle
         case solo(requestID: UUID, task: Task<Void, Never>)
@@ -23,6 +34,8 @@ public actor InferenceScheduler {
 
     private var currentMode: Mode = .idle
     private var isShuttingDown = false
+    private var soloPromotionRequested = false
+    private var pendingSoloPromotion: SoloPromotion?
 
     private var activeRequests: [UUID: ActiveRequest] = [:]
     private var queuedRequests: [InferenceRequest] = []
@@ -97,6 +110,8 @@ public actor InferenceScheduler {
         uidToRequestID.removeAll()
         pendingBatchRemovals.removeAll()
         cancelledRequests.removeAll()
+        pendingSoloPromotion = nil
+        soloPromotionRequested = false
     }
 
     private func handleSubmit(
@@ -218,6 +233,8 @@ public actor InferenceScheduler {
                 task.cancel()
                 currentMode = .idle
                 await updateMode()
+            } else if activeRequests.count > 1 {
+                soloPromotionRequested = true
             }
         case .batch:
             break
@@ -230,6 +247,8 @@ public actor InferenceScheduler {
         let stopTokens = buildStopTokens()
         let tokens = MLXArray(entry.request.tokens)
         let lmInput = LMInput(tokens: tokens)
+
+        var promoted = false
 
         do {
             var iterator = try TokenIterator(
@@ -287,21 +306,50 @@ public actor InferenceScheduler {
                     finishReason = .length
                     break
                 }
+
+                if !promoted,
+                    soloPromotionRequested,
+                    pendingSoloPromotion == nil,
+                    activeRequests.count > 1
+                {
+                    soloPromotionRequested = false
+                    let promotion = SoloPromotion(
+                        requestID: requestID,
+                        nextTokens: iterator.y.tokens,
+                        generatedTokens: emitCount,
+                        sampler: iterator.sampler,
+                        processor: iterator.processor,
+                        caches: iterator.cache,
+                        maxTokens: entry.request.maxTokens,
+                        promptTokenCount: entry.request.tokens.count
+                    )
+                    pendingSoloPromotion = promotion
+                    promoted = true
+                    break
+                }
             }
 
-            let completionEvent = TokenEvent(
-                requestID: requestID,
-                token: nil,
-                textDelta: nil,
-                finishReason: finishReason,
-                logProbs: nil
-            )
-            entry.continuation.yield(completionEvent)
-            entry.continuation.finish()
+            if !promoted {
+                let completionEvent = TokenEvent(
+                    requestID: requestID,
+                    token: nil,
+                    textDelta: nil,
+                    finishReason: finishReason,
+                    logProbs: nil
+                )
+                entry.continuation.yield(completionEvent)
+                entry.continuation.finish()
+            }
 
         } catch {
             entry.continuation.finish()
             requestStats.removeValue(forKey: requestID)
+        }
+
+        if promoted {
+            currentMode = .idle
+            await updateMode()
+            return
         }
 
         activeRequests.removeValue(forKey: requestID)
@@ -327,6 +375,29 @@ public actor InferenceScheduler {
             stopTokens: buildStopTokens(),
             unknownTokenId: context.tokenizer.unknownTokenId
         )
+
+        if let promotion = pendingSoloPromotion,
+            activeRequests[promotion.requestID] != nil,
+            !cancelledRequests.contains(promotion.requestID)
+        {
+            let uid = iterator.adoptExisting(
+                caches: promotion.caches,
+                nextTokens: promotion.nextTokens,
+                sampler: promotion.sampler,
+                processor: promotion.processor,
+                maxTokens: promotion.maxTokens,
+                generatedTokens: promotion.generatedTokens,
+                promptTokenCount: promotion.promptTokenCount
+            )
+            uidToRequestID[uid] = promotion.requestID
+            if var entry = activeRequests[promotion.requestID] {
+                entry.uid = uid
+                activeRequests[promotion.requestID] = entry
+            }
+            pendingSoloPromotion = nil
+        } else if pendingSoloPromotion != nil {
+            pendingSoloPromotion = nil
+        }
 
         while !Task.isCancelled {
             if isShuttingDown { break }

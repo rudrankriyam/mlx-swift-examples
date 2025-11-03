@@ -374,6 +374,44 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
         }
     }
 
+    public mutating func adoptExisting(
+        caches: [KVCache],
+        nextTokens: MLXArray,
+        sampler: LogitSampler,
+        processor: (any LogitProcessor)?,
+        maxTokens: Int,
+        generatedTokens: Int,
+        promptTokenCount promptCount: Int
+    ) -> Int {
+        let uid = uidCounter
+        uidCounter += 1
+
+        let convertedCaches = caches.map { convertSoloCache($0, leftPadding: [0]) }
+
+        let processors: [LogitProcessorBox?]
+        if let processor {
+            processors = [LogitProcessorBox(processor)]
+        } else {
+            processors = [nil]
+        }
+
+        activeBatch = ActiveBatch(
+            uids: [uid],
+            tokens: nextTokens,
+            prevSelectedLogits: nil,
+            maxTokens: [maxTokens],
+            numTokens: [generatedTokens],
+            cache: convertedCaches,
+            samplers: [sampler],
+            processors: processors
+        )
+
+        promptTokenCount += promptCount
+        generationTokenCount += generatedTokens
+
+        return uid
+    }
+
     public mutating func next() -> [Response]? {
         if activeBatch == nil && unprocessedPrompts.isEmpty {
             return nil
@@ -624,6 +662,40 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
     private func normalizeLogProbsRow(_ row: MLXArray) -> MLXArray {
         let logSum = logSumExp(row, axis: row.ndim - 1, keepDims: true)
         return row - logSum
+    }
+
+    private func convertSoloCache(_ cache: KVCache, leftPadding: [Int]) -> KVCache {
+        switch cache {
+        case let simple as KVCacheSimple:
+            let batch = BatchKVCache(leftPadding: leftPadding)
+            let state = simple.state
+            if state.count == 2 {
+                _ = batch.update(keys: state[0], values: state[1])
+            }
+            return batch
+        case let rotating as RotatingKVCache:
+            guard let maxSize = rotating.maxSize else {
+                fatalError("RotatingKVCache promotion requires a maxSize")
+            }
+            let batch = BatchRotatingKVCache(maxSize: maxSize, leftPadding: leftPadding)
+            let state = rotating.state
+            if state.count == 2 {
+                _ = batch.update(keys: state[0], values: state[1])
+            }
+            batch.metaState = rotating.metaState
+            return batch
+        case let arrays as ArraysCache:
+            let converted = ArraysCache(size: arrays.state.count, leftPadding: leftPadding)
+            converted.state = arrays.state
+            return converted
+        case let list as CacheList:
+            let convertedChildren = (0 ..< list.count).map { index in
+                convertSoloCache(list[index], leftPadding: leftPadding)
+            }
+            return CacheList(convertedChildren)
+        default:
+            return cache
+        }
     }
 }
 

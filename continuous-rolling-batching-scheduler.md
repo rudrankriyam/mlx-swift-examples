@@ -1174,125 +1174,136 @@ The continuous and rolling batching scheduler has been successfully implemented 
 
 #### ⚠️ ContentView.swift - ISSUE IDENTIFIED
 **Location**: `Applications/LLMEval/ContentView.swift` (lines 780-962)
-**Status**: Has server simulation issue in continuous mode
+**Status**: Has sequential processing issue in continuous mode
 
-**Problem**: `generateContinuousBatchPrompts()` doesn't properly simulate a server
-- **Current behavior**: Sequential submission with 1-second delays between requests
-- **Code**: `for (index, tokens) in tokenized.enumerated()` with `Task.sleep(for: .seconds(1))`
-- **Issue**: Not server-like - submits all prompts sequentially, then stops
+**Problem**: `generateContinuousBatchPrompts()` processes streams sequentially instead of concurrently
+- **Current behavior**: User-provided prompts are submitted with staggered timing ✅ (This is correct!)
+- **Issue**: Streams are processed sequentially due to task group structure, not concurrently
+- **Root cause**: Task group delays prevent true concurrent stream processing
 
-**Expected behavior**: Continuous request generation simulating real server load
-- Generate new requests every 1-2 seconds indefinitely (or for fixed duration)  
-- Use random prompt selection from templates
-- Track results asynchronously as they complete
-- Simulate realistic server arrival patterns
+**Expected behavior**: Concurrent stream processing of timed user prompts
+- Submit user-provided prompts with planned timing ✅ (Already working)  
+- Process all streams concurrently through the scheduler ❌ (Not working)
+- Allow scheduler to demonstrate true concurrent batching capabilities ❌ (Blocked by sequential processing)
 
 ---
 
 ## Outstanding Issues
 
-### HIGH PRIORITY: Fix Server Simulation in ContentView.swift
+### HIGH PRIORITY: Fix Sequential Processing in ContentView.swift
 
 **Current Implementation Problem**:
 ```swift
-// Lines 847-848 in generateContinuousBatchPrompts()
-for (index, tokens) in tokenized.enumerated() {
-    // ... submit request
-    if index < tokenized.count - 1 {
-        try await Task.sleep(for: .seconds(1))  // ❌ Only delays submission
+// Lines 847-962 in generateContinuousBatchPrompts()
+try await withThrowingTaskGroup(of: Void.self) { group in
+    for (index, tokens) in tokenized.enumerated() {
+        group.addTask {
+            if index > 0 {
+                let delay = UInt64(Double(index) * Double(staggerNanoseconds))
+                try await Task.sleep(nanoseconds: delay)  // ❌ Causes sequential processing
+            }
+            
+            // Submit request (this part is correct)
+            let stream = await scheduler.submit(request)
+            for await event in stream { ... }  // ❌ But streams process sequentially
+        }
     }
 }
 ```
 
 **Issues**:
-1. **Not server-like**: All requests submitted in sequence with delays
-2. **Fixed sequence**: Can't simulate random arrival patterns  
-3. **No ongoing arrivals**: Once prompts are submitted, no new requests arrive
-4. **Limited test scope**: Only tests the predefined prompts
+1. **Sequential delays**: Task group delays prevent concurrent stream processing
+2. **Not truly concurrent**: First stream must make progress before others start effectively  
+3. **Defeats batching purpose**: Scheduler can't demonstrate concurrent batch processing
+4. **Poor performance**: Doesn't showcase the scheduler's concurrent capabilities
 
 **Recommended Fix**:
 ```swift
 private func generateContinuousBatchPrompts(promptText: String) async {
-    // Parse prompts as templates
-    let promptTemplates = promptText
-        .split(separator: "\n")
-        .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-        .filter { !$0.isEmpty }
+    // ... existing setup code (keep as-is) ...
     
-    guard !promptTemplates.isEmpty else {
-        self.output = "No prompt templates provided."
-        return
-    }
+    // Fix: Remove delays from task group, calculate start times instead
+    let baseTime = Date()
     
-    let scheduler = InferenceScheduler(context: context, config: schedulerConfig)
-    
-    // Track results as they arrive
-    var results: [BatchResult] = []
-    let resultsLock = NSLock()
-    
-    // Background task: Generate requests every 1-2 seconds  
-    let serverTask = Task {
-        var requestCount = 0
-        while !Task.isCancelled && requestCount < 20 { // Run for 20 requests
-            let template = promptTemplates.randomElement()!
-            let prompt = "\(template) (Request #\(requestCount + 1))"
+    await withTaskGroup(of: Void.self) { group in
+        for (index, tokens) in tokenized.enumerated() {
+            let prompt = prompts[index]
+            let startTime = baseTime.addingTimeInterval(Double(index) * continuousStaggerSeconds)
             
-            let tokens = try context.tokenizer.encode(text: prompt)
-            let request = InferenceRequest(
-                tokens: tokens,
-                params: generateParameters,
-                maxTokens: generateParameters.maxTokens ?? 128
-            )
-            
-            // Submit request and handle response asynchronously
-            Task {
-                let stream = await scheduler.submit(request)
-                var response = ""
-                var tokenCount = 0
+            group.addTask {
+                // Wait until it's time for this specific request
+                let now = Date()
+                if startTime > now {
+                    let delay = startTime.timeIntervalSince(now)
+                    try? await Task.sleep(for: .seconds(delay))
+                }
                 
+                // Submit immediately to scheduler (no more delays)
+                var requestParameters = baseParameters
+                if requestParameters.maxTokens == nil {
+                    requestParameters.maxTokens = maxTokens
+                }
+                
+                let request = InferenceRequest(
+                    tokens: tokens,
+                    params: requestParameters,
+                    maxTokens: requestParameters.maxTokens ?? maxTokens
+                )
+                
+                // Process stream concurrently with all others
+                let stream = await scheduler.submit(request)
+                var accumulatedText = ""
+                var generatedTokens = 0
+                var finishReason: BatchGenerateResult.FinishReason?
+                
+                // Stream processing runs concurrently for all requests
                 for await event in stream {
-                    if let delta = event.textDelta {
-                        response += delta
-                        tokenCount += 1
+                    if Task.isCancelled { break }
+                    
+                    if let token = event.token {
+                        generatedTokens += 1
                     }
                     
-                    if event.finishReason != nil {
-                        let result = BatchResult(
-                            prompt: prompt,
-                            response: response,
-                            tokenCount: tokenCount,
-                            finishReason: event.finishReason?.rawValue ?? "complete"
+                    if let delta = event.textDelta, !delta.isEmpty {
+                        accumulatedText += delta
+                    } else if let token = event.token {
+                        let fragment = tokenizer.decode(
+                            tokens: [token], 
+                            skipSpecialTokens: true
                         )
-                        
-                        resultsLock.lock()
-                        results.append(result)
-                        Task { @MainActor in
-                            self.batchResults = results.sorted { $0.prompt < $1.prompt }
-                        }
-                        resultsLock.unlock()
+                        accumulatedText += fragment
+                    }
+                    
+                    if let reason = event.finishReason {
+                        finishReason = reason
+                    }
+                    
+                    // Update UI concurrently
+                    Task { @MainActor in
+                        guard index < self.batchResults.count else { return }
+                        self.batchResults[index] = BatchResult(
+                            prompt: prompt,
+                            response: accumulatedText,
+                            tokenCount: generatedTokens,
+                            finishReason: finishReason?.rawValue ?? "generating"
+                        )
                     }
                 }
             }
-            
-            requestCount += 1
-            // Random arrival time: 0.5-2.0 seconds
-            let sleepTime = Double.random(in: 0.5...2.0)
-            try await Task.sleep(for: .seconds(sleepTime))
         }
+        
+        // All tasks now run truly concurrently
     }
     
-    // Let it run for a while, then cleanup
-    try? await Task.sleep(for: .seconds(25))
-    serverTask.cancel()
-    await scheduler.shutdown()
+    // ... rest of existing cleanup code ...
 }
 ```
 
 **Benefits of Fix**:
-- **True server simulation**: Continuous request arrivals over time
-- **Realistic patterns**: Random arrival timing and prompt selection  
-- **Ongoing load**: Generates requests continuously, not just initial batch
-- **Better testing**: More comprehensive test of scheduler under realistic load
+- **True concurrent processing**: All streams process simultaneously once submitted
+- **Proper scheduler testing**: Allows scheduler to demonstrate real concurrent batching capabilities  
+- **Better performance**: Multiple streams can generate tokens in parallel
+- **Maintains user timing**: Still respects user-specified prompt timing while enabling concurrency
 
 ---
 
@@ -1347,7 +1358,8 @@ Tests/MLXSchedulerTests/
 - ✅ Swift 6 concurrency-safe (no warnings)
 
 ### ⚠️ Issues to Resolve
-- ⚠️ **Server simulation in ContentView.swift**: `generateContinuousBatchPrompts` needs proper continuous request generation
+- ⚠️ **Sequential processing in ContentView.swift**: `generateContinuousBatchPrompts` needs concurrent stream processing fix
+- ✅ **User prompt timing**: Correctly implements timed execution of user-provided prompts
 
 ### 📋 Testing TODO  
 - [ ] Add unit tests for InferenceScheduler core functionality
