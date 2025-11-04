@@ -665,33 +665,11 @@ class LLMEvaluator {
                         }
                     }
 
-                    // Update UI with current state
-                    Task { @MainActor in
-                        self.batchResults = uids.enumerated().map { (idx, uid) in
-                            let tokens = generatedTokens[uid] ?? []
-                            let text = context.tokenizer.decode(tokens: tokens, skipSpecialTokens: true)
-                            let finish = finishReasons[uid]?.rawValue ?? "generating"
-
-                            return BatchResult(
-                                prompt: prompts[idx],
-                                response: text,
-                                tokenCount: tokens.count,
-                                finishReason: finish
-                            )
-                        }
-                    }
-                }
-
-                Stream().synchronize()
-
-                let stats = iterator.stats()
-
-                // Final update with statistics
-                Task { @MainActor in
-                    self.batchResults = uids.enumerated().map { (idx, uid) in
+                    // Update UI with current state - create isolated copies for MainActor
+                    let currentResults = uids.enumerated().map { (idx, uid) -> BatchResult in
                         let tokens = generatedTokens[uid] ?? []
                         let text = context.tokenizer.decode(tokens: tokens, skipSpecialTokens: true)
-                        let finish = finishReasons[uid]?.rawValue ?? "complete"
+                        let finish = finishReasons[uid]?.rawValue ?? "generating"
 
                         return BatchResult(
                             prompt: prompts[idx],
@@ -700,6 +678,32 @@ class LLMEvaluator {
                             finishReason: finish
                         )
                     }
+                    
+                    Task { @MainActor [currentResults] in
+                        self.batchResults = currentResults
+                    }
+                }
+
+                Stream().synchronize()
+
+                let stats = iterator.stats()
+
+                // Final update with statistics - create isolated copies
+                let finalResults = uids.enumerated().map { (idx, uid) -> BatchResult in
+                    let tokens = generatedTokens[uid] ?? []
+                    let text = context.tokenizer.decode(tokens: tokens, skipSpecialTokens: true)
+                    let finish = finishReasons[uid]?.rawValue ?? "complete"
+
+                    return BatchResult(
+                        prompt: prompts[idx],
+                        response: text,
+                        tokenCount: tokens.count,
+                        finishReason: finish
+                    )
+                }
+                
+                Task { @MainActor [finalResults] in
+                    self.batchResults = finalResults
 
                     // Also set output for non-batch mode fallback
                     var formattedOutput = "# Batch Generation Results\n\n"
@@ -756,9 +760,7 @@ class LLMEvaluator {
 
             MLXRandom.seed(UInt64(Date.timeIntervalSinceReferenceDate * 1000))
 
-            var aggregatedStats: AggregatedStats?
-
-            try await modelContainer.perform { (context: ModelContext) -> Void in
+            let aggregatedStats = try await modelContainer.perform { (context: ModelContext) -> AggregatedStats? in
                 let tokenizer = context.tokenizer
                 let baseParameters = generateParameters
                 let maxTokens = baseParameters.maxTokens ?? 128
@@ -843,26 +845,28 @@ class LLMEvaluator {
 
                                 if !started {
                                     started = true
-                                    Task { @MainActor in
+                                    let currentText = accumulatedText
+                                    let currentTokens = generatedTokens
+                                    Task { @MainActor [currentText, currentTokens] in
                                         guard index < self.batchResults.count else { return }
                                         self.batchResults[index] = BatchResult(
                                             prompt: prompt,
-                                            response: accumulatedText,
-                                            tokenCount: generatedTokens,
+                                            response: currentText,
+                                            tokenCount: currentTokens,
                                             finishReason: "running"
                                         )
                                     }
                                 }
 
-                                if let token = event.token {
+                                if event.token != nil {
                                     generatedTokens += 1
                                 }
 
                                 if let delta = event.textDelta, !delta.isEmpty {
                                     accumulatedText += delta
-                                } else if let token = event.token {
+                                } else if event.token != nil {
                                     let fragment = tokenizer.decode(
-                                        tokens: [token],
+                                        tokens: [event.token!],
                                         skipSpecialTokens: true
                                     )
                                     accumulatedText += fragment
@@ -872,14 +876,17 @@ class LLMEvaluator {
                                     finishReason = reason
                                 }
 
+                                // Create isolated copies before sending to MainActor
+                                let currentText = accumulatedText
+                                let currentTokens = generatedTokens
                                 let status = finishReason?.rawValue ?? "generating"
 
-                                Task { @MainActor in
+                                Task { @MainActor [currentText, currentTokens, status] in
                                     guard index < self.batchResults.count else { return }
                                     self.batchResults[index] = BatchResult(
                                         prompt: prompt,
-                                        response: accumulatedText,
-                                        tokenCount: generatedTokens,
+                                        response: currentText,
+                                        tokenCount: currentTokens,
                                         finishReason: status
                                     )
                                 }
@@ -896,12 +903,15 @@ class LLMEvaluator {
                             } else {
                                 finalStatus = "cancelled"
                             }
-                            Task { @MainActor in
+                            // Create final isolated copies
+                            let finalText = accumulatedText
+                            let finalTokens = generatedTokens
+                            Task { @MainActor [finalText, finalTokens, finalStatus] in
                                 guard index < self.batchResults.count else { return }
                                 self.batchResults[index] = BatchResult(
                                     prompt: prompt,
-                                    response: accumulatedText,
-                                    tokenCount: generatedTokens,
+                                    response: finalText,
+                                    tokenCount: finalTokens,
                                     finishReason: finalStatus
                                 )
                             }
@@ -914,7 +924,7 @@ class LLMEvaluator {
                 Stream().synchronize()
 
                 let aggregated = await scheduler.aggregatedStats()
-                aggregatedStats = aggregated
+                return aggregated
             }
 
             if let aggregated = aggregatedStats {
