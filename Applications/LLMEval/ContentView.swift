@@ -150,7 +150,13 @@ struct ContentView: View {
                                     }
 
                                     // Footer
-                                    Text("\(result.tokenCount) tokens • \(result.finishReason)")
+                                    let tpsText = result.tokensPerSecond.map { String(format: "%.2f tokens/s", $0) }
+                                    let summary = [
+                                        "\(result.tokenCount) tokens",
+                                        result.finishReason,
+                                        tpsText
+                                    ].compactMap { $0 }.joined(separator: " • ")
+                                    Text(summary)
                                         .font(.system(size: 9))
                                         .foregroundColor(.secondary)
                                         .padding(.top, 8)
@@ -316,6 +322,7 @@ class LLMEvaluator {
         let response: String
         let tokenCount: Int
         let finishReason: String
+        let tokensPerSecond: Double?
     }
     var batchResults: [BatchResult] = []
 
@@ -543,69 +550,6 @@ class LLMEvaluator {
                     prefillStepSize: 2048,
                     generation: batchGenParams
                 )
-
-                /* Yeah I think not
-                // For single prompt, use normal streaming (much faster)
-                if prompts.count == 1 {
-                    let messages = [[
-                        "role": "user",
-                        "content": prompts[0]
-                    ]]
-                    let tokens = try context.tokenizer.applyChatTemplate(messages: messages)
-                    let input = LMInput(tokens: MLXArray(tokens))
-
-                    var output = ""
-                    var tokenCount = 0
-
-                    // Initialize batch results
-                    Task { @MainActor in
-                        self.batchResults = [BatchResult(
-                            prompt: prompts[0],
-                            response: "",
-                            tokenCount: 0,
-                            finishReason: "generating"
-                        )]
-                    }
-
-                    for try await item in try MLXLMCommon.generate(
-                        input: input,
-                        parameters: batchGenParams,
-                        context: context
-                    ) {
-                        switch item {
-                        case .chunk(let string):
-                            output += string
-                            tokenCount += 1
-
-                            // Update UI
-                            Task { @MainActor in
-                                self.batchResults = [BatchResult(
-                                    prompt: prompts[0],
-                                    response: output,
-                                    tokenCount: tokenCount,
-                                    finishReason: "generating"
-                                )]
-                            }
-
-                        case .info:
-                            // Final update
-                            Task { @MainActor in
-                                self.batchResults = [BatchResult(
-                                    prompt: prompts[0],
-                                    response: output,
-                                    tokenCount: tokenCount,
-                                    finishReason: "completed"
-                                )]
-                            }
-
-                        case .toolCall:
-                            break
-                        }
-                    }
-
-                    return
-                }
-                 */
                  
                 // Use streaming batch generation for multiple prompts
                 // Apply chat template to each prompt
@@ -646,7 +590,8 @@ class LLMEvaluator {
                             prompt: prompt,
                             response: "",
                             tokenCount: 0,
-                            finishReason: "generating"
+                            finishReason: "generating",
+                            tokensPerSecond: nil
                         )
                     }
                 }
@@ -675,7 +620,8 @@ class LLMEvaluator {
                             prompt: prompts[idx],
                             response: text,
                             tokenCount: tokens.count,
-                            finishReason: finish
+                            finishReason: finish,
+                            tokensPerSecond: nil
                         )
                     }
                     
@@ -698,7 +644,8 @@ class LLMEvaluator {
                         prompt: prompts[idx],
                         response: text,
                         tokenCount: tokens.count,
-                        finishReason: finish
+                        finishReason: finish,
+                        tokensPerSecond: nil
                     )
                 }
                 
@@ -712,7 +659,11 @@ class LLMEvaluator {
                         formattedOutput += "> \(batch.prompt)\n\n"
                         formattedOutput += "**Response:**\n"
                         formattedOutput += "\(batch.response)\n\n"
-                        formattedOutput += "*\(batch.tokenCount) tokens • \(batch.finishReason)*\n\n"
+                        var metrics = "\(batch.tokenCount) tokens • \(batch.finishReason)"
+                        if let tps = batch.tokensPerSecond {
+                            metrics += " • \(String(format: "%.2f", tps)) tokens/s"
+                        }
+                        formattedOutput += "*\(metrics)*\n\n"
                         if idx < self.batchResults.count - 1 {
                             formattedOutput += "---\n\n"
                         }
@@ -789,7 +740,8 @@ class LLMEvaluator {
                             prompt: prompt,
                             response: "",
                             tokenCount: 0,
-                            finishReason: status
+                            finishReason: status,
+                            tokensPerSecond: nil
                         )
                     }
                 }
@@ -802,7 +754,13 @@ class LLMEvaluator {
                     returnLogProbs: false
                 )
 
-                let scheduler = InferenceScheduler(context: context, config: schedulerConfig)
+                // SAFETY: This is safe because we're within ModelContainer.perform{} isolation boundary.
+                // The ModelContext is designed to be used within this actor context, and InferenceScheduler
+                // is an actor that will maintain proper isolation of the context. The 'unsafe' annotation
+                // acknowledges that we're intentionally transferring the context across concurrency boundaries
+                // in a controlled manner that maintains thread safety.
+                nonisolated(unsafe) let contextForScheduler = context
+                let scheduler = InferenceScheduler(context: contextForScheduler, config: schedulerConfig)
                 defer {
                     Task { await scheduler.shutdown() }
                 }
@@ -853,7 +811,8 @@ class LLMEvaluator {
                                             prompt: prompt,
                                             response: currentText,
                                             tokenCount: currentTokens,
-                                            finishReason: "running"
+                                            finishReason: "running",
+                                            tokensPerSecond: nil
                                         )
                                     }
                                 }
@@ -887,7 +846,8 @@ class LLMEvaluator {
                                         prompt: prompt,
                                         response: currentText,
                                         tokenCount: currentTokens,
-                                        finishReason: status
+                                        finishReason: status,
+                                        tokensPerSecond: nil
                                     )
                                 }
                             }
@@ -906,13 +866,19 @@ class LLMEvaluator {
                             // Create final isolated copies
                             let finalText = accumulatedText
                             let finalTokens = generatedTokens
-                            Task { @MainActor [finalText, finalTokens, finalStatus] in
+                            let requestID = request.id
+                            let tpsStats = await scheduler.stats(for: requestID)
+                            let perStreamTPS = (tpsStats?.tokensPerSecond ?? 0) > 0
+                                ? tpsStats?.tokensPerSecond
+                                : nil
+                            Task { @MainActor [finalText, finalTokens, finalStatus, perStreamTPS] in
                                 guard index < self.batchResults.count else { return }
                                 self.batchResults[index] = BatchResult(
                                     prompt: prompt,
                                     response: finalText,
                                     tokenCount: finalTokens,
-                                    finishReason: finalStatus
+                                    finishReason: finalStatus,
+                                    tokensPerSecond: perStreamTPS
                                 )
                             }
                         }
@@ -939,7 +905,11 @@ class LLMEvaluator {
                 formattedOutput += "> \(batch.prompt)\n\n"
                 formattedOutput += "**Response:**\n"
                 formattedOutput += "\(batch.response)\n\n"
-                formattedOutput += "*\(batch.tokenCount) tokens • \(batch.finishReason)*\n\n"
+                var metrics = "\(batch.tokenCount) tokens • \(batch.finishReason)"
+                if let tps = batch.tokensPerSecond {
+                    metrics += " • \(String(format: "%.2f", tps)) tokens/s"
+                }
+                formattedOutput += "*\(metrics)*\n\n"
                 if idx < batchResults.count - 1 {
                     formattedOutput += "---\n\n"
                 }
