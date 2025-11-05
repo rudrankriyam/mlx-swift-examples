@@ -632,7 +632,7 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
 
         for index in 0..<samplers.count {
             let sampler = samplers[index]
-            var logitsRow = selected[index..<(index + 1), .ellipsis]
+            var logitsRow = selected[index, .ellipsis]
 
             if var processor = processors[index] {
                 logitsRow = processor.process(logits: logitsRow)
