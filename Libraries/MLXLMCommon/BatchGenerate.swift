@@ -732,7 +732,7 @@ public func batchGenerate(
     let uids = iterator.insert(prompts: tokenized, maxTokens: defaultMaxTokens)
 
     var generatedTokens = [Int: [Int]]()
-    var logProbHistory = [Int: [MLXArray]]()
+    var logProbHistory: [Int: [MLXArray]]? = parameters.returnLogProbs ? [Int: [MLXArray]]() : nil
     var finishReasons = [Int: BatchGenerateResult.FinishReason]()
 
     while let responses = iterator.next(), !responses.isEmpty {
@@ -742,7 +742,10 @@ public func batchGenerate(
             }
             // Do NOT eval per token; keep device-resident to avoid sync stalls.
             if let lp = response.logProbs {
-                logProbHistory[response.uid, default: []].append(lp)
+                if var dict = logProbHistory {
+                    dict[response.uid, default: []].append(lp)
+                    logProbHistory = dict
+                }
             }
             if let finish = response.finishReason {
                 finishReasons[response.uid] = finish
@@ -760,7 +763,7 @@ public func batchGenerate(
         let tokens = generatedTokens[uid] ?? []
         let text = context.tokenizer.decode(tokens: tokens)
         let finish = finishReasons[uid] ?? .unspecified
-        let logProbRows = logProbHistory[uid] ?? []
+        let logProbRows = logProbHistory?[uid] ?? []
         let logProbs = logProbRows.isEmpty ? nil : MLX.stacked(logProbRows, axis: 0)
 
         sequences.append(
