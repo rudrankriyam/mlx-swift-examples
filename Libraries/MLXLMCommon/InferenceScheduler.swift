@@ -471,8 +471,12 @@ public actor InferenceScheduler {
                 activeRequests[requestID] = entry
 
                 let text = context.tokenizer.decode(tokens: [response.token])
-                let logProbs: MLXArray? =
-                    config.returnLogProbs && response.logProbs.size > 0 ? response.logProbs : nil
+                let logProbs: MLXArray?
+                if let lp = response.logProbs {
+                    logProbs = config.returnLogProbs && lp.size > 0 ? response.logProbs : nil
+                } else {
+                    logProbs = nil
+                }
 
                 let event = TokenEvent(
                     requestID: requestID,

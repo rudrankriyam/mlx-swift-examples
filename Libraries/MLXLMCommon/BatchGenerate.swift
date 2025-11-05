@@ -68,7 +68,7 @@ public struct BatchGenerateParameters: Sendable {
         prefillBatchSize: Int = 8,
         prefillStepSize: Int = 2_048,
         generation: GenerateParameters = .init(),
-        returnLogProbs: Bool = true
+        returnLogProbs: Bool = false
     ) {
         self.defaultMaxTokens = maxTokens
         self.completionBatchSize = completionBatchSize
@@ -257,13 +257,12 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
     public struct Response: Sendable {
         public let uid: Int
         public let token: Int
-        public let logProbs: MLXArray
+        public let logProbs: MLXArray?
         public let finishReason: BatchGenerateResult.FinishReason?
-
         public init(
             uid: Int,
             token: Int,
-            logProbs: MLXArray,
+            logProbs: MLXArray?,
             finishReason: BatchGenerateResult.FinishReason?
         ) {
             self.uid = uid
@@ -519,18 +518,17 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
                 keepIndices.append(idx)
             }
 
-            let logProbRow: MLXArray
+            let logProbRow: MLXArray?
             if returnLogProbs, let sel = previousSelected {
                 logProbRow = normalizeLogProbsRow(sel[idx])
             } else {
-                logProbRow = MLXArray([])
+                logProbRow = nil
             }
-            responses.append(
-                Response(
-                    uid: currentBatch.uids[idx],
-                    token: token,
-                    logProbs: logProbRow,
-                    finishReason: finish))
+            responses.append(Response(
+                uid: currentBatch.uids[idx],
+                token: token,
+                logProbs: logProbRow,
+                finishReason: finish))
         }
 
         currentBatch.tokens = nextTokens
@@ -743,7 +741,9 @@ public func batchGenerate(
                 generatedTokens[response.uid, default: []].append(response.token)
             }
             // Do NOT eval per token; keep device-resident to avoid sync stalls.
-            logProbHistory[response.uid, default: []].append(response.logProbs)
+            if let lp = response.logProbs {
+                logProbHistory[response.uid, default: []].append(lp)
+            }
             if let finish = response.finishReason {
                 finishReasons[response.uid] = finish
             }
