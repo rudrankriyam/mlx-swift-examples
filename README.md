@@ -1,4 +1,6 @@
 # Documentation
+[![Star History Chart](https://api.star-history.com/svg?repos=rudrankriyam/mlx-swift-examples&type=Date)](https://star-history.com/#rudrankriyam/mlx-swift-examples&Date)
+
 
 Developers can use these examples in their own programs -- just import the swift package!
 
