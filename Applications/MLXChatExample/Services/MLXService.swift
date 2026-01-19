@@ -18,6 +18,15 @@ class MLXService {
     /// List of available models that can be used for generation.
     /// Includes both language models (LLM) and vision-language models (VLM).
     static let availableModels: [LMModel] = [
+        LMModel(
+            name: "glm4.7-flash:4bit",
+            configuration: ModelConfiguration(
+                id: "mlx-community/GLM-4.7-Flash-4bit",
+                defaultPrompt: "Why is the sky blue?",
+                extraEOSTokens: ["<|user|>", "<|observation|>"]
+            ),
+            type: .llm
+        ),
         LMModel(name: "llama3.2:1b", configuration: LLMRegistry.llama3_2_1B_4bit, type: .llm),
         LMModel(name: "qwen2.5:1.5b", configuration: LLMRegistry.qwen2_5_1_5b, type: .llm),
         LMModel(name: "smolLM:135m", configuration: LLMRegistry.smolLM_135M_4bit, type: .llm),
@@ -89,29 +98,35 @@ class MLXService {
         // Load or retrieve model from cache
         let modelContainer = try await load(model: model)
 
-        // Map app-specific Message type to Chat.Message for model input
-        let chat = messages.map { message in
-            let role: Chat.Message.Role =
-                switch message.role {
-                case .assistant:
-                    .assistant
-                case .user:
-                    .user
-                case .system:
-                    .system
-                }
+        let userInput: UserInput
+        if isGLM4Flash(model) {
+            let prompt = glm4ChatPrompt(from: messages)
+            userInput = UserInput(prompt: .text(prompt))
+        } else {
+            // Map app-specific Message type to Chat.Message for model input
+            let chat = messages.map { message in
+                let role: Chat.Message.Role =
+                    switch message.role {
+                    case .assistant:
+                        .assistant
+                    case .user:
+                        .user
+                    case .system:
+                        .system
+                    }
 
-            // Process any attached media for VLM models
-            let images: [UserInput.Image] = message.images.map { imageURL in .url(imageURL) }
-            let videos: [UserInput.Video] = message.videos.map { videoURL in .url(videoURL) }
+                // Process any attached media for VLM models
+                let images: [UserInput.Image] = message.images.map { imageURL in .url(imageURL) }
+                let videos: [UserInput.Video] = message.videos.map { videoURL in .url(videoURL) }
 
-            return Chat.Message(
-                role: role, content: message.content, images: images, videos: videos)
+                return Chat.Message(
+                    role: role, content: message.content, images: images, videos: videos)
+            }
+
+            // Prepare input for model processing
+            userInput = UserInput(
+                chat: chat, processing: .init(resize: .init(width: 1024, height: 1024)))
         }
-
-        // Prepare input for model processing
-        let userInput = UserInput(
-            chat: chat, processing: .init(resize: .init(width: 1024, height: 1024)))
 
         // Generate response using the model
         return try await modelContainer.perform { (context: ModelContext) in
@@ -123,4 +138,29 @@ class MLXService {
                 input: lmInput, parameters: parameters, context: context)
         }
     }
+}
+
+private func isGLM4Flash(_ model: LMModel) -> Bool {
+    switch model.configuration.id {
+    case .id(let id, _):
+        return id == "mlx-community/GLM-4.7-Flash-4bit"
+    case .directory:
+        return false
+    }
+}
+
+private func glm4ChatPrompt(from messages: [Message]) -> String {
+    var prompt = "[gMASK]<sop>"
+    for message in messages {
+        switch message.role {
+        case .system:
+            prompt += "<|system|>\n\(message.content)"
+        case .user:
+            prompt += "<|user|>\n\(message.content)"
+        case .assistant:
+            prompt += "<|assistant|>\n\(message.content)"
+        }
+    }
+    prompt += "<|assistant|>"
+    return prompt
 }

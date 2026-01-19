@@ -3387,15 +3387,15 @@
 			repositoryURL = "https://github.com/ml-explore/mlx-swift";
 			requirement = {
 				kind = upToNextMajorVersion;
-				minimumVersion = 0.25.4;
+				minimumVersion = 0.30.2;
 			};
 		};
 		C32AA12E2EB97625002914C6 /* XCRemoteSwiftPackageReference "mlx-swift-lm" */ = {
 			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/ml-explore/mlx-swift-lm";
+			repositoryURL = "https://github.com/rudrankriyam/mlx-swift-lm";
 			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 2.29.2;
+				kind = branch;
+				branch = glm4-moe-lite-port;
 			};
 		};
 		C32B4C6B2DA7132C00EF663D /* XCRemoteSwiftPackageReference "swift-async-algorithms" */ = {

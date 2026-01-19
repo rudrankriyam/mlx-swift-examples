@@ -1,5 +1,5 @@
 {
-  "originHash" : "0dd305f09ba278569849d2b91cb2ef7a95956604f60ef1c3013f0e7b4b61d1a7",
+  "originHash" : "f42bd79d680d15529ff38a5d76e60ad1074b5e6c38d03f544f5d8a34dceaa8e3",
   "pins" : [
     {
       "identity" : "gzipswift",
@@ -15,17 +15,17 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/ml-explore/mlx-swift",
       "state" : {
-        "revision" : "072b684acaae80b6a463abab3a103732f33774bf",
-        "version" : "0.29.1"
+        "revision" : "f58bd2c2b3b84316da69182f436db4219aff30b9",
+        "version" : "0.30.2"
       }
     },
     {
       "identity" : "mlx-swift-lm",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/ml-explore/mlx-swift-lm",
+      "location" : "https://github.com/rudrankriyam/mlx-swift-lm",
       "state" : {
-        "revision" : "01852971866b17889f7aff27500cc62d9148b0df",
-        "version" : "2.29.2"
+        "branch" : "glm4-moe-lite-port",
+        "revision" : "7c3216c2ad30e99c22931876330f30a4c35d2cdf"
       }
     },
     {
@@ -114,8 +114,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/huggingface/swift-transformers",
       "state" : {
-        "revision" : "94610577e4af9bbc267060af1e25e977604dd796",
-        "version" : "1.1.1"
+        "revision" : "573e5c9036c2f136b3a8a071da8e8907322403d0",
+        "version" : "1.1.6"
       }
     }
   ],

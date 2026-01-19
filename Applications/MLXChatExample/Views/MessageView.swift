@@ -20,6 +20,24 @@ struct MessageView: View {
         self.message = message
     }
 
+    private func splitThinking(_ content: String) -> (thinking: String?, after: String?) {
+        guard let startRange = content.range(of: "<think>") else {
+            return (nil, content.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        guard let endRange = content.range(of: "</think>") else {
+            let thinking = String(content[startRange.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return (thinking, nil)
+        }
+
+        let thinking = String(content[startRange.upperBound ..< endRange.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let afterThink = String(content[endRange.upperBound...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return (thinking, afterThink.isEmpty ? nil : afterThink)
+    }
+
     var body: some View {
         switch message.role {
         case .user:
@@ -61,8 +79,23 @@ struct MessageView: View {
             // Assistant messages are left-aligned without background
             // LocalizedStringKey used to trigger default handling of markdown content.
             HStack {
-                Text(LocalizedStringKey(message.content))
-                    .textSelection(.enabled)
+                let (thinking, afterThink) = splitThinking(message.content)
+                VStack(alignment: .leading, spacing: 8) {
+                    if let thinking {
+                        Text(LocalizedStringKey(thinking))
+                            .italic()
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+
+                    if let afterThink {
+                        Text(LocalizedStringKey(afterThink))
+                            .textSelection(.enabled)
+                    } else if thinking == nil {
+                        Text(LocalizedStringKey(message.content))
+                            .textSelection(.enabled)
+                    }
+                }
 
                 Spacer()
             }
