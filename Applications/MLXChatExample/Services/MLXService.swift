@@ -98,35 +98,29 @@ class MLXService {
         // Load or retrieve model from cache
         let modelContainer = try await load(model: model)
 
-        let userInput: UserInput
-        if isGLM4Flash(model) {
-            let prompt = glm4ChatPrompt(from: messages)
-            userInput = UserInput(prompt: .text(prompt))
-        } else {
-            // Map app-specific Message type to Chat.Message for model input
-            let chat = messages.map { message in
-                let role: Chat.Message.Role =
-                    switch message.role {
-                    case .assistant:
-                        .assistant
-                    case .user:
-                        .user
-                    case .system:
-                        .system
-                    }
+        // Map app-specific Message type to Chat.Message for model input
+        let chat = messages.map { message in
+            let role: Chat.Message.Role =
+                switch message.role {
+                case .assistant:
+                    .assistant
+                case .user:
+                    .user
+                case .system:
+                    .system
+                }
 
-                // Process any attached media for VLM models
-                let images: [UserInput.Image] = message.images.map { imageURL in .url(imageURL) }
-                let videos: [UserInput.Video] = message.videos.map { videoURL in .url(videoURL) }
+            // Process any attached media for VLM models
+            let images: [UserInput.Image] = message.images.map { imageURL in .url(imageURL) }
+            let videos: [UserInput.Video] = message.videos.map { videoURL in .url(videoURL) }
 
-                return Chat.Message(
-                    role: role, content: message.content, images: images, videos: videos)
-            }
-
-            // Prepare input for model processing
-            userInput = UserInput(
-                chat: chat, processing: .init(resize: .init(width: 1024, height: 1024)))
+            return Chat.Message(
+                role: role, content: message.content, images: images, videos: videos)
         }
+
+        // Prepare input for model processing
+        let userInput = UserInput(
+            chat: chat, processing: .init(resize: .init(width: 1024, height: 1024)))
 
         // Generate response using the model
         return try await modelContainer.perform { (context: ModelContext) in
@@ -140,27 +134,3 @@ class MLXService {
     }
 }
 
-private func isGLM4Flash(_ model: LMModel) -> Bool {
-    switch model.configuration.id {
-    case .id(let id, _):
-        return id == "mlx-community/GLM-4.7-Flash-4bit"
-    case .directory:
-        return false
-    }
-}
-
-private func glm4ChatPrompt(from messages: [Message]) -> String {
-    var prompt = "[gMASK]<sop>"
-    for message in messages {
-        switch message.role {
-        case .system:
-            prompt += "<|system|>\n\(message.content)"
-        case .user:
-            prompt += "<|user|>\n\(message.content)"
-        case .assistant:
-            prompt += "<|assistant|>\n\(message.content)"
-        }
-    }
-    prompt += "<|assistant|>"
-    return prompt
-}
